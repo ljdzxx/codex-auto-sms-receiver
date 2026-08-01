@@ -116,7 +116,7 @@ def test_run_codex_only_passes_custom_email_otp_provider(monkeypatch):
     assert restored == [FakeCodex.sms_provider]
 
 
-def test_generic_api_otp_provider_caps_wait_and_disables_resend(monkeypatch):
+def test_generic_api_otp_provider_uses_extended_wait_and_disables_resend(monkeypatch):
     project_root = Path(__file__).resolve().parents[1]
     settings = SimpleNamespace(project_root=project_root, data_dir=project_root / "data")
     upstream_bridge._ensure_upstream_imports(settings)
@@ -129,6 +129,8 @@ def test_generic_api_otp_provider_caps_wait_and_disables_resend(monkeypatch):
         return "654321"
 
     monkeypatch.setattr(generic_api_mail_client, "fetch_latest_otp", fake_fetch)
+    monkeypatch.delenv("GENERIC_API_OTP_MAX_WAIT", raising=False)
+    monkeypatch.delenv("GENERIC_API_OTP_POLL_INTERVAL", raising=False)
     provider, cleanup = upstream_bridge._generic_api_otp_provider(
         {
             "email": "owner@example.com",
@@ -140,9 +142,33 @@ def test_generic_api_otp_provider_caps_wait_and_disables_resend(monkeypatch):
         assert captured == {
             "email": "owner@example.com",
             "after_ts": 123.0,
-            "kwargs": {"max_wait": 30, "poll_interval": 2},
+            "kwargs": {"max_wait": 90, "poll_interval": 2},
         }
         assert provider.codex_max_email_otp_attempts == 1
+    finally:
+        cleanup()
+
+
+def test_generic_api_otp_provider_allows_bounded_polling_overrides(monkeypatch):
+    project_root = Path(__file__).resolve().parents[1]
+    settings = SimpleNamespace(project_root=project_root, data_dir=project_root / "data")
+    upstream_bridge._ensure_upstream_imports(settings)
+    from core import generic_api_mail_client
+
+    captured = {}
+    monkeypatch.setenv("GENERIC_API_OTP_MAX_WAIT", "120")
+    monkeypatch.setenv("GENERIC_API_OTP_POLL_INTERVAL", "2")
+    monkeypatch.setattr(
+        generic_api_mail_client,
+        "fetch_latest_otp",
+        lambda email, after_ts, **kwargs: captured.update(kwargs) or "654321",
+    )
+    provider, cleanup = upstream_bridge._generic_api_otp_provider(
+        {"email": "owner@example.com", "code_url": "https://mail.example.test/code"}
+    )
+    try:
+        assert provider("owner@example.com", 123.0) == "654321"
+        assert captured == {"max_wait": 120, "poll_interval": 2}
     finally:
         cleanup()
 

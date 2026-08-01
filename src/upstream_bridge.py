@@ -21,7 +21,16 @@ SAFE_DEFAULTS = {
     "USE_EMAIL_SERVICE": "True",
 }
 
-GENERIC_API_OTP_MAX_WAIT_SECONDS = 30
+GENERIC_API_OTP_MAX_WAIT_SECONDS = 90
+GENERIC_API_OTP_POLL_INTERVAL_SECONDS = 3
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def _load_runtime_environment(settings: Settings) -> None:
@@ -98,9 +107,23 @@ def _generic_api_otp_provider(mailbox: dict) -> tuple[Callable, Callable[[], Non
     def get_otp(target_email: str, after_ts: float, **kwargs) -> str:
         if target_email.casefold() != email.casefold():
             raise RuntimeError("OTP 请求邮箱与已导入账号不一致")
-        # iCloud / 通用 API 取码只等待一轮。即使全局邮箱配置更长，
-        # 也要在 30 秒后把控制权交还给流水线，避免单个账号长期占用并发。
-        kwargs["max_wait"] = GENERIC_API_OTP_MAX_WAIT_SECONDS
+        # 取码页的邮件到达常比 30 秒更慢。使用独立可配置窗口，
+        # 避免全局 OTP 参数较短时过早判定失败。
+        kwargs["max_wait"] = _bounded_env_int(
+            "GENERIC_API_OTP_MAX_WAIT",
+            GENERIC_API_OTP_MAX_WAIT_SECONDS,
+            30,
+            300,
+        )
+        kwargs.setdefault(
+            "poll_interval",
+            _bounded_env_int(
+                "GENERIC_API_OTP_POLL_INTERVAL",
+                GENERIC_API_OTP_POLL_INTERVAL_SECONDS,
+                1,
+                30,
+            ),
+        )
         return generic_api_mail_client.fetch_latest_otp(target_email, after_ts=after_ts, **kwargs)
 
     # 上游协议默认会重发邮箱并连续等待三轮。通用 API 取码超时后直接结束，

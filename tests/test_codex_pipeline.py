@@ -273,6 +273,18 @@ def test_pipeline_rejects_unsafe_limits_and_second_active_batch(tmp_path: Path):
     blocker.set()
 
 
+def test_generic_mailbox_timeouts_and_proxy_errors_are_retryable(tmp_path: Path):
+    mailbox_store, _ = _mailboxes(tmp_path, count=1)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+
+    assert manager._failure_info(
+        "GenericApiMailError: 等待通用 API 验证码超时；HTTP 200 但未提取到验证码"
+    ) == ("mailbox_otp_timeout", True, 15)
+    assert manager._failure_info(
+        "GenericApiMailError: 网络请求失败（ProxyError）"
+    ) == ("transient_network", True, 0)
+
+
 def test_isolated_worker_process_starts_and_stops_cleanly(tmp_path: Path):
     context = multiprocessing.get_context("spawn")
     task_queue = context.Queue()

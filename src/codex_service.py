@@ -427,6 +427,8 @@ class CodexJobManager:
     @staticmethod
     def _failure_info(message: str, status: str = "", http_status: Any = None) -> tuple[str, bool, int]:
         text = f"{status} {message}".casefold()
+        if "等待通用 api 验证码超时" in text:
+            return "mailbox_otp_timeout", True, 15
         if any(value in text for value in ("rate_limit", "too many", "请求过多")):
             return "rate_limited", True, 180
         if any(
@@ -439,6 +441,7 @@ class CodexJobManager:
                 "timeout",
                 "connection reset",
                 "connection aborted",
+                "proxyerror",
                 "temporary failure",
                 "curl: (28)",
                 "curl: (35)",
