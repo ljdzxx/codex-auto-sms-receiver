@@ -1,0 +1,751 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import logging
+import multiprocessing
+import os
+import queue
+import re
+import threading
+import time
+import uuid
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from .artifact_store import _redact_log_text
+from .mailbox_store import MailboxStore
+from .settings import Settings
+from .sms_config import normalize_hero_countries
+from .upstream_location import resolve_upstream_root
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _after(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0, seconds))).isoformat()
+
+
+def _parse_time(value: Any) -> float:
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+_PHONE_ATTEMPT = re.compile(r"手机验证尝试\s+\d+\s*/\s*\d+.*?号码=\+?(\d{7,15})")
+
+
+class CodexJobManager:
+    """Persistent batch scheduler for existing-account Codex OAuth jobs."""
+
+    _ACTIVE_JOBS = {"queued", "running", "retry_wait"}
+    _TERMINAL_JOBS = {"success", "failed", "stopped", "deactivated", "skipped"}
+    _ACTIVE_PIPELINES = {"queued", "running", "paused", "stopping"}
+    _MAX_CONCURRENCY = 3
+    _MAX_RETRY_LIMIT = 3
+    _MAX_BATCH_SIZE = 200
+
+    def __init__(self, settings: Settings, mailbox_store: MailboxStore):
+        self.settings = settings
+        self.mailbox_store = mailbox_store
+        self.upstream_root = resolve_upstream_root(settings.project_root)
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._pipelines: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._data_dir = Path(getattr(settings, "data_dir", mailbox_store.data_dir))
+        self._log_dir = Path(getattr(settings, "log_dir", settings.project_root / "logs"))
+        self._state_path = self._data_dir / "pipeline-state.json"
+        self._mp_context = multiprocessing.get_context("spawn")
+        self._task_queue = None
+        self._result_queue = None
+        self._workers: list[Any] = []
+        self._load_state()
+        self._recover_interrupted()
+
+    def availability(self) -> dict:
+        if not (self.upstream_root / "core" / "codex_oauth.py").is_file():
+            return {"available": False, "reason": "未找到原项目 core/codex_oauth.py"}
+        missing = [name for name in ("curl_cffi", "Crypto", "pyotp") if importlib.util.find_spec(name) is None]
+        if missing:
+            return {"available": False, "reason": "缺少依赖：" + ", ".join(missing)}
+        driver = (os.getenv("CODEX_OAUTH_DRIVER", "protocol") or "protocol").strip().lower()
+        auth_source = (os.getenv("CODEX_AUTH_URL_SOURCE", "local") or "local").strip().lower()
+        if driver not in {"protocol", "api", "http"}:
+            return {"available": False, "reason": "此独立项目仅支持 CODEX_OAUTH_DRIVER=protocol"}
+        if auth_source == "cpa" and not os.getenv("CPA_MANAGEMENT_KEY", "").strip():
+            return {"available": False, "reason": "CPA 模式缺少 CPA_MANAGEMENT_KEY"}
+        if not os.getenv("HERO_SMS_API_KEY", "").strip():
+            return {"available": False, "reason": "Hero SMS 缺少 HERO_SMS_API_KEY"}
+        try:
+            countries = normalize_hero_countries(os.getenv("HERO_SMS_COUNTRIES", ""))
+        except ValueError:
+            countries = []
+        if not countries:
+            return {"available": False, "reason": "Hero SMS 至少需要选择 1 个国家"}
+        return {"available": True, "reason": ""}
+
+    def runtime_config(self) -> dict:
+        return {
+            "driver": "protocol",
+            "auth_source": os.getenv("CODEX_AUTH_URL_SOURCE", "local") or "local",
+            "sms_provider": "hero",
+            "outlook_fetch_mode": os.getenv("OUTLOOK_FETCH_MODE", "direct") or "direct",
+            "pipeline_max_concurrency": self._MAX_CONCURRENCY,
+            "pipeline_max_retries": self._MAX_RETRY_LIMIT,
+        }
+
+    @staticmethod
+    def _otp_ready(mailbox: dict[str, Any]) -> bool:
+        if mailbox.get("source") in {"generic_api", "code_url"}:
+            return bool(str(mailbox.get("code_url") or "").strip())
+        if mailbox.get("source") == "password_totp":
+            return bool(
+                str(mailbox.get("password") or "").strip()
+                and str(mailbox.get("totp_secret") or "").strip()
+            )
+        return bool(str(mailbox.get("client_id") or "").strip() and str(mailbox.get("refresh_token") or "").strip())
+
+    def _load_state(self) -> None:
+        if not self._state_path.is_file():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        jobs = payload.get("jobs")
+        pipelines = payload.get("pipelines")
+        if isinstance(jobs, dict):
+            self._jobs = {str(key): value for key, value in jobs.items() if isinstance(value, dict)}
+        if isinstance(pipelines, dict):
+            self._pipelines = {
+                str(key): value for key, value in pipelines.items() if isinstance(value, dict)
+            }
+
+    def _persist_locked(self) -> None:
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self._data_dir / f".{self._state_path.name}.{uuid.uuid4().hex}.tmp"
+        payload = {"version": 1, "pipelines": self._pipelines, "jobs": self._jobs}
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self._state_path)
+
+    def _recover_interrupted(self) -> None:
+        changed = False
+        with self._lock:
+            for job in self._jobs.values():
+                if str(job.get("status") or "") in self._ACTIVE_JOBS:
+                    job.update(
+                        status="failed",
+                        stage="服务已重启",
+                        message="服务重启中断了上一次任务，可重新加入流水线",
+                        failure_code="service_restarted",
+                        retryable=False,
+                        next_retry_at=None,
+                        finished_at=_now(),
+                    )
+                    changed = True
+            for pipeline in self._pipelines.values():
+                if str(pipeline.get("status") or "") in self._ACTIVE_PIPELINES:
+                    pipeline.update(status="interrupted", finished_at=_now())
+                    changed = True
+            if changed:
+                self._persist_locked()
+        if changed:
+            for job in self._jobs.values():
+                if job.get("failure_code") == "service_restarted":
+                    self.mailbox_store.update_codex(
+                        str(job.get("email") or ""),
+                        status="failed",
+                        message="服务重启中断了上一次任务",
+                    )
+
+    def _public_job(self, item: dict) -> dict:
+        row = deepcopy(item)
+        current_log = row.pop("log_path", None)
+        log_paths = row.pop("log_paths", [])
+        credential_path = row.pop("credential_path", None)
+        candidates = list(log_paths) if isinstance(log_paths, list) else []
+        if current_log:
+            candidates.append(current_log)
+        existing_logs: set[str] = set()
+        try:
+            log_root = self._log_dir.resolve()
+        except OSError:
+            log_root = self._log_dir
+        for value in candidates:
+            try:
+                resolved = Path(str(value or "")).resolve(strict=True)
+                resolved.relative_to(log_root)
+            except (OSError, ValueError):
+                continue
+            if resolved.is_file():
+                existing_logs.add(str(resolved))
+        row["has_log"] = bool(existing_logs)
+        row["log_count"] = len(existing_logs)
+        row["has_credential"] = bool(credential_path)
+        row["message"] = _redact_log_text(str(row.get("message") or ""))[:500]
+        return row
+
+    def list_jobs(self) -> list[dict]:
+        with self._lock:
+            rows = [self._public_job(item) for item in self._jobs.values()]
+        rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return rows[:500]
+
+    def _pipeline_public_locked(self, pipeline: dict[str, Any]) -> dict[str, Any]:
+        job_ids = [str(value) for value in pipeline.get("job_ids") or []]
+        jobs = [self._jobs[job_id] for job_id in job_ids if job_id in self._jobs]
+        count_names = ("queued", "running", "retry_wait", "success", "failed", "stopped", "deactivated", "skipped")
+        counts = {name: sum(1 for job in jobs if job.get("status") == name) for name in count_names}
+        terminal = sum(counts[name] for name in self._TERMINAL_JOBS)
+        public = {key: deepcopy(value) for key, value in pipeline.items() if key != "job_ids"}
+        public.update(
+            {
+                "total": len(jobs),
+                "counts": counts,
+                "completed": terminal,
+                "progress": round((terminal / len(jobs)) * 100, 1) if jobs else 0.0,
+                "active": str(pipeline.get("status") or "") in self._ACTIVE_PIPELINES,
+            }
+        )
+        return public
+
+    def pipeline_overview(self, pipeline_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            selected = self._pipelines.get(str(pipeline_id or "")) if pipeline_id else None
+            if selected is None:
+                active = [
+                    item
+                    for item in self._pipelines.values()
+                    if str(item.get("status") or "") in self._ACTIVE_PIPELINES
+                ]
+                candidates = active or list(self._pipelines.values())
+                selected = max(candidates, key=lambda item: str(item.get("created_at") or "")) if candidates else None
+            if selected is None:
+                return {
+                    "id": "",
+                    "status": "idle",
+                    "active": False,
+                    "concurrency": 1,
+                    "retry_limit": 0,
+                    "total": 0,
+                    "completed": 0,
+                    "progress": 0.0,
+                    "counts": {},
+                }
+            return self._pipeline_public_locked(selected)
+
+    def _has_active_pipeline_locked(self) -> bool:
+        return any(
+            str(item.get("status") or "") in self._ACTIVE_PIPELINES
+            for item in self._pipelines.values()
+        )
+
+    def start(self, email: str) -> dict:
+        pipeline = self.start_batch([email], concurrency=1, retry_limit=0)
+        pipeline_id = str(pipeline["id"])
+        with self._lock:
+            job = next(item for item in self._jobs.values() if item.get("pipeline_id") == pipeline_id)
+            return self._public_job(job)
+
+    def start_batch(
+        self,
+        emails: Iterable[str],
+        *,
+        concurrency: int = 1,
+        retry_limit: int = 0,
+        retry_backoff_seconds: int = 30,
+    ) -> dict[str, Any]:
+        try:
+            concurrency = int(concurrency)
+            retry_limit = int(retry_limit)
+            retry_backoff_seconds = int(retry_backoff_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("流水线并发和重试参数必须是整数") from exc
+        if concurrency < 1 or concurrency > self._MAX_CONCURRENCY:
+            raise ValueError(f"任务并发必须在 1 - {self._MAX_CONCURRENCY} 之间")
+        if retry_limit < 0 or retry_limit > self._MAX_RETRY_LIMIT:
+            raise ValueError(f"失败重试必须在 0 - {self._MAX_RETRY_LIMIT} 之间")
+        if retry_backoff_seconds < 5 or retry_backoff_seconds > 600:
+            raise ValueError("重试间隔必须在 5 - 600 秒之间")
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for email in emails:
+            value = str(email or "").strip()
+            key = value.casefold()
+            if value and key not in seen:
+                normalized.append(value)
+                seen.add(key)
+        if not normalized:
+            raise ValueError("请至少选择 1 个账号")
+        if len(normalized) > self._MAX_BATCH_SIZE:
+            raise ValueError(f"单批最多处理 {self._MAX_BATCH_SIZE} 个账号")
+        availability = self.availability()
+        if not availability["available"]:
+            raise RuntimeError(availability["reason"])
+
+        mailboxes: list[dict[str, Any]] = []
+        for email in normalized:
+            mailbox = self.mailbox_store.get_secret(email=email)
+            if mailbox is None:
+                raise ValueError(f"账号未导入：{email}")
+            if not self._otp_ready(mailbox):
+                raise ValueError(f"邮箱 OTP 配置未就绪：{email}")
+            mailboxes.append(mailbox)
+
+        self._ensure_workers(concurrency)
+        pipeline_id = uuid.uuid4().hex
+        created_at = _now()
+        job_mailboxes: dict[str, dict[str, Any]] = {}
+        with self._lock:
+            if self._has_active_pipeline_locked():
+                raise RuntimeError("已有流水线正在运行")
+            job_ids: list[str] = []
+            for mailbox in mailboxes:
+                job_id = uuid.uuid4().hex
+                job_ids.append(job_id)
+                job_mailboxes[job_id] = mailbox
+                self._jobs[job_id] = {
+                    "id": job_id,
+                    "pipeline_id": pipeline_id,
+                    "account_id": mailbox.get("id"),
+                    "email": mailbox.get("email"),
+                    "source": mailbox.get("source"),
+                    "status": "queued",
+                    "stage": "等待执行",
+                    "message": "已加入流水线",
+                    "attempt": 0,
+                    "max_attempts": 1 + retry_limit,
+                    "failure_code": "",
+                    "retryable": False,
+                    "next_retry_at": None,
+                    "stop_requested": False,
+                    "created_at": created_at,
+                    "started_at": None,
+                    "finished_at": None,
+                    "log_path": None,
+                    "log_paths": [],
+                    "credential_path": None,
+                    "phone_verified": False,
+                }
+            self._pipelines[pipeline_id] = {
+                "id": pipeline_id,
+                "status": "queued",
+                "concurrency": concurrency,
+                "retry_limit": retry_limit,
+                "retry_backoff_seconds": retry_backoff_seconds,
+                "pause_requested": False,
+                "stop_requested": False,
+                "created_at": created_at,
+                "started_at": None,
+                "paused_at": None,
+                "resumed_at": None,
+                "finished_at": None,
+                "job_ids": job_ids,
+            }
+            self._persist_locked()
+            public = self._pipeline_public_locked(self._pipelines[pipeline_id])
+
+        threading.Thread(
+            target=self._run_pipeline,
+            args=(pipeline_id, job_mailboxes),
+            name=f"codex-pipeline-{pipeline_id[:8]}",
+            daemon=True,
+        ).start()
+        return public
+
+    def _ensure_workers(self, count: int) -> None:
+        from .codex_worker import WorkerSettings, worker_main
+
+        with self._lock:
+            self._workers = [worker for worker in self._workers if worker.is_alive()]
+            if self._task_queue is None:
+                self._task_queue = self._mp_context.Queue()
+                self._result_queue = self._mp_context.Queue()
+            while len(self._workers) < count:
+                worker = self._mp_context.Process(
+                    target=worker_main,
+                    args=(
+                        WorkerSettings(
+                            project_root=Path(self.settings.project_root),
+                            data_dir=self._data_dir,
+                        ),
+                        self._task_queue,
+                        self._result_queue,
+                    ),
+                    name=f"codex-worker-{len(self._workers) + 1}",
+                    daemon=True,
+                )
+                worker.start()
+                self._workers.append(worker)
+
+    def _dispatch_locked(self, job: dict[str, Any], mailbox: dict[str, Any]) -> str:
+        job["attempt"] = int(job.get("attempt") or 0) + 1
+        attempt = int(job["attempt"])
+        log_path = self._log_dir / (
+            f"codex-{job.get('account_id')}-{job['id'][:8]}-a{attempt}.log"
+        )
+        dispatch_id = uuid.uuid4().hex
+        job.update(
+            status="running",
+            stage="登录与授权",
+            message=f"正在执行第 {attempt}/{job['max_attempts']} 次",
+            retryable=False,
+            next_retry_at=None,
+            started_at=job.get("started_at") or _now(),
+            finished_at=None,
+            log_path=str(log_path),
+        )
+        job.setdefault("log_paths", []).append(str(log_path))
+        self.mailbox_store.update_codex(
+            str(job.get("email") or ""),
+            status="running",
+            message=f"流水线执行中（第 {attempt}/{job['max_attempts']} 次）",
+        )
+        self._task_queue.put(
+            {
+                "dispatch_id": dispatch_id,
+                "job_id": job["id"],
+                "attempt": attempt,
+                "mailbox": mailbox,
+                "log_path": str(log_path),
+            }
+        )
+        return dispatch_id
+
+    @staticmethod
+    def _failure_info(message: str, status: str = "", http_status: Any = None) -> tuple[str, bool, int]:
+        text = f"{status} {message}".casefold()
+        if any(value in text for value in ("rate_limit", "too many", "请求过多")):
+            return "rate_limited", True, 180
+        if any(
+            value in text
+            for value in (
+                "tls",
+                "sslerror",
+                "ssl connect",
+                "timed out",
+                "timeout",
+                "connection reset",
+                "connection aborted",
+                "temporary failure",
+                "curl: (28)",
+                "curl: (35)",
+            )
+        ):
+            return "transient_network", True, 0
+        try:
+            code = int(http_status or 0)
+        except (TypeError, ValueError):
+            code = 0
+        if code in {408, 425, 429, 500, 502, 503, 504}:
+            return "transient_http", True, 180 if code == 429 else 0
+        if "no_balance" in text or "余额" in text:
+            return "sms_no_balance", False, 0
+        if "bad_key" in text or "api key" in text:
+            return "sms_bad_key", False, 0
+        if "fraud_guard" in text or "suspicious behavior" in text:
+            return "fraud_guard", False, 0
+        if "phone_number_in_use" in text or "phone number already in use" in text:
+            return "phone_number_in_use", False, 0
+        if "邮箱" in text and any(value in text for value in ("凭证", "refresh", "未就绪")):
+            return "mailbox_unavailable", False, 0
+        return "task_failed", False, 0
+
+    @staticmethod
+    def _phone_from_log(path: str | None) -> str:
+        if not path:
+            return ""
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        if "手机号验证通过" not in text:
+            return ""
+        matches = _PHONE_ATTEMPT.findall(text)
+        return f"+{matches[-1]}" if matches else ""
+
+    def _handle_result_locked(self, job: dict[str, Any], response: dict[str, Any], pipeline: dict[str, Any]) -> None:
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        error = str(response.get("error") or "")
+        error_type = str(response.get("error_type") or "")
+        if error:
+            status = "failed"
+            message = f"{error_type}: {error}" if error_type else error
+            credential_path = None
+            http_status = None
+        elif result.get("ok"):
+            status = "success"
+            message = str(result.get("message") or "Codex OAuth 完成")
+            credential_path = str(result.get("file_path") or "") or None
+            http_status = result.get("http_status")
+        else:
+            status = str(result.get("status") or "failed")
+            message = str(result.get("message") or "Codex OAuth 失败")
+            credential_path = None
+            http_status = result.get("http_status")
+
+        # Worker/vendor errors are untrusted text.  Sanitize once before any
+        # scheduler or mailbox state is persisted so new state files never
+        # retain credentials accidentally embedded in an exception message.
+        message = _redact_log_text(message)[:500]
+
+        if status == "success":
+            phone_number = self._phone_from_log(job.get("log_path"))
+            job.update(
+                status="success",
+                stage="已完成",
+                message=message[:500],
+                credential_path=credential_path,
+                phone_verified=bool(phone_number),
+                phone_number=phone_number,
+                failure_code="",
+                retryable=False,
+                next_retry_at=None,
+                finished_at=_now(),
+            )
+            self.mailbox_store.update_codex(
+                str(job.get("email") or ""),
+                status="success",
+                message=message[:500],
+                credential_path=credential_path,
+                phone_verified=bool(phone_number),
+                phone_number=phone_number or None,
+            )
+            return
+
+        if status in {"deactivated", "skipped"}:
+            job.update(
+                status=status,
+                stage="已结束",
+                message=message[:500],
+                failure_code=status,
+                retryable=False,
+                next_retry_at=None,
+                finished_at=_now(),
+            )
+            self.mailbox_store.update_codex(
+                str(job.get("email") or ""), status=status, message=message[:500]
+            )
+            return
+
+        failure_code, retryable, minimum_delay = self._failure_info(message, status, http_status)
+        can_retry = (
+            retryable
+            and int(job.get("attempt") or 0) < int(job.get("max_attempts") or 1)
+            and not bool(pipeline.get("stop_requested"))
+            and not bool(job.get("stop_requested"))
+        )
+        if can_retry:
+            base = int(pipeline.get("retry_backoff_seconds") or 30)
+            exponent = max(0, int(job.get("attempt") or 1) - 1)
+            delay = max(minimum_delay, min(600, base * (3**exponent)))
+            job.update(
+                status="retry_wait",
+                stage="等待重试",
+                message=f"临时失败，{delay} 秒后重试：{message[:360]}",
+                failure_code=failure_code,
+                retryable=True,
+                next_retry_at=_after(delay),
+                finished_at=None,
+            )
+            self.mailbox_store.update_codex(
+                str(job.get("email") or ""),
+                status="retry_wait",
+                message=f"临时失败，等待第 {int(job.get('attempt') or 0)+1}/{job['max_attempts']} 次执行",
+            )
+            return
+
+        job.update(
+            status="failed",
+            stage="执行失败",
+            message=message[:500],
+            failure_code=failure_code,
+            retryable=retryable,
+            next_retry_at=None,
+            finished_at=_now(),
+        )
+        self.mailbox_store.update_codex(
+            str(job.get("email") or ""), status="failed", message=message[:500]
+        )
+
+    def _run_pipeline(self, pipeline_id: str, mailboxes: dict[str, dict[str, Any]]) -> None:
+        inflight: dict[str, str] = {}
+        with self._lock:
+            pipeline = self._pipelines.get(pipeline_id)
+            if pipeline is None:
+                return
+            pipeline.update(
+                status="paused" if pipeline.get("pause_requested") else "running",
+                started_at=pipeline.get("started_at") or _now(),
+            )
+            self._persist_locked()
+
+        while True:
+            with self._lock:
+                pipeline = self._pipelines.get(pipeline_id)
+                if pipeline is None:
+                    return
+                job_ids = [str(value) for value in pipeline.get("job_ids") or []]
+                changed = False
+                if pipeline.get("stop_requested"):
+                    for job_id in job_ids:
+                        job = self._jobs.get(job_id)
+                        if job and job.get("status") in {"queued", "retry_wait"}:
+                            job.update(
+                                status="stopped",
+                                stage="已停止",
+                                message="流水线已停止，任务未再派发",
+                                next_retry_at=None,
+                                finished_at=_now(),
+                            )
+                            self.mailbox_store.update_codex(
+                                str(job.get("email") or ""),
+                                status="stopped",
+                                message="流水线停止前尚未执行",
+                            )
+                            changed = True
+
+                now_ts = time.time()
+                ready = [] if pipeline.get("pause_requested") else [
+                    self._jobs[job_id]
+                    for job_id in job_ids
+                    if job_id in self._jobs
+                    and self._jobs[job_id].get("status") in {"queued", "retry_wait"}
+                    and (
+                        self._jobs[job_id].get("status") == "queued"
+                        or _parse_time(self._jobs[job_id].get("next_retry_at")) <= now_ts
+                    )
+                ]
+                ready.sort(key=lambda item: (str(item.get("next_retry_at") or ""), str(item.get("created_at") or "")))
+                slots = max(0, int(pipeline.get("concurrency") or 1) - len(inflight))
+                for job in ready[:slots]:
+                    if pipeline.get("stop_requested") or pipeline.get("pause_requested"):
+                        break
+                    dispatch_id = self._dispatch_locked(job, mailboxes[job["id"]])
+                    inflight[dispatch_id] = job["id"]
+                    changed = True
+                jobs = [self._jobs[job_id] for job_id in job_ids if job_id in self._jobs]
+                all_terminal = bool(jobs) and all(job.get("status") in self._TERMINAL_JOBS for job in jobs)
+                if changed:
+                    self._persist_locked()
+                if all_terminal and not inflight:
+                    # A stopped batch may still contain truthful success/failure
+                    # results from work that was already in flight.  Keep those
+                    # per-job results, while making the batch-level state reflect
+                    # the user's stop request.
+                    pipeline["status"] = "stopped" if pipeline.get("stop_requested") else "completed"
+                    pipeline["finished_at"] = _now()
+                    self._persist_locked()
+                    return
+
+            try:
+                response = self._result_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not isinstance(response, dict):
+                continue
+            dispatch_id = str(response.get("dispatch_id") or "")
+            job_id = inflight.pop(dispatch_id, None)
+            if job_id is None:
+                continue
+            with self._lock:
+                pipeline = self._pipelines.get(pipeline_id)
+                job = self._jobs.get(job_id)
+                if pipeline is None or job is None:
+                    continue
+                self._handle_result_locked(job, response, pipeline)
+                self._persist_locked()
+
+    def pause_pipeline(self, pipeline_id: str) -> bool:
+        """Pause future dispatches while allowing already-running jobs to finish."""
+
+        with self._lock:
+            pipeline = self._pipelines.get(str(pipeline_id or ""))
+            if not pipeline or str(pipeline.get("status") or "") not in {"queued", "running"}:
+                return False
+            pipeline.update(
+                pause_requested=True,
+                status="paused",
+                paused_at=_now(),
+            )
+            self._persist_locked()
+            return True
+
+    def resume_pipeline(self, pipeline_id: str) -> bool:
+        """Resume dispatching queued and retry-wait jobs in a paused pipeline."""
+
+        with self._lock:
+            pipeline = self._pipelines.get(str(pipeline_id or ""))
+            if (
+                not pipeline
+                or str(pipeline.get("status") or "") != "paused"
+                or pipeline.get("stop_requested")
+            ):
+                return False
+            pipeline.update(
+                pause_requested=False,
+                status="running",
+                paused_at=None,
+                resumed_at=_now(),
+            )
+            self._persist_locked()
+            return True
+
+    def stop_pipeline(self, pipeline_id: str) -> bool:
+        with self._lock:
+            pipeline = self._pipelines.get(str(pipeline_id or ""))
+            if not pipeline or str(pipeline.get("status") or "") not in self._ACTIVE_PIPELINES:
+                return False
+            pipeline["pause_requested"] = False
+            pipeline["stop_requested"] = True
+            pipeline["status"] = "stopping"
+            for job_id in pipeline.get("job_ids") or []:
+                job = self._jobs.get(str(job_id))
+                if job and job.get("status") == "running":
+                    job["stop_requested"] = True
+                    job["message"] = "已停止派发后续任务；当前网络步骤将执行完"
+            self._persist_locked()
+            return True
+
+    def stop(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(str(job_id or ""))
+            if not job or job.get("status") not in self._ACTIVE_JOBS:
+                return False
+            if job.get("status") in {"queued", "retry_wait"}:
+                job.update(
+                    status="stopped",
+                    stage="已停止",
+                    message="任务在执行前被停止",
+                    next_retry_at=None,
+                    finished_at=_now(),
+                )
+            else:
+                job["stop_requested"] = True
+                job["message"] = "已请求停止重试；当前网络步骤将执行完"
+            self._persist_locked()
+            return True
+
+    def is_account_active(self, email: str) -> bool:
+        target = str(email or "").strip().casefold()
+        with self._lock:
+            return any(
+                str(job.get("email") or "").casefold() == target
+                and str(job.get("status") or "") in self._ACTIVE_JOBS
+                for job in self._jobs.values()
+            )
+
+
+__all__ = ["CodexJobManager"]
