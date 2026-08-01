@@ -849,6 +849,22 @@ class ArtifactStore:
             return None
         return path
 
+    def delete_credentials(self, artifact_ids: list[str]) -> int:
+        """Delete selected credential artifacts after resolving every ID first."""
+
+        normalized = list(dict.fromkeys(str(value or "").strip().lower() for value in artifact_ids))
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("请至少选择一个凭证")
+        paths: list[Path] = []
+        for artifact_id in normalized:
+            path = self.exportable_credential_file(artifact_id)
+            if path is None:
+                raise KeyError("所选凭证不存在或不可删除")
+            paths.append(path)
+        for path in paths:
+            path.unlink()
+        return len(paths)
+
     def phone_verification_for_account(self, account_id: str) -> dict[str, str] | None:
         """Recover the newest successful phone verification from this account's OAuth logs."""
 

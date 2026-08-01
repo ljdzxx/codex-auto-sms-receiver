@@ -130,6 +130,25 @@ def test_import_password_totp_allows_pipe_characters_in_password(workspace_path:
     assert secret["totp_secret"] == "JBSWY3DPEHPK3PXP"
 
 
+def test_export_original_preserves_each_import_format_and_delete_many(workspace_path: Path):
+    store = MailboxStore(workspace_path)
+    outlook = "mail@example.com====mail-pass====client-id====refresh-token"
+    generic = "code@example.com----fixture-api-key"
+    totp = "totp@example.com|chatgpt|password|JBSWY3DPEHPK3PXP"
+    store.import_text("outlook", outlook)
+    store.import_text("generic_api", generic)
+    store.import_text("password_totp", totp)
+
+    rows = store.list_accounts()
+    grouped = store.export_original([row["id"] for row in rows])
+
+    assert grouped["outlook"] == [outlook]
+    assert grouped["generic_api"] == [generic]
+    assert grouped["password_totp"] == [totp]
+    assert store.delete_many([row["id"] for row in rows[:2]]) == 2
+    assert len(store.list_accounts()) == 1
+
+
 @pytest.mark.parametrize(
     "material",
     [

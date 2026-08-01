@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ipaddress
+import io
+import json
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -589,6 +592,117 @@ def create_app(
         response.call_on_close(buffer.close)
         return response
 
+    def _selected_credential_files(data) -> list[tuple[Path, str]]:
+        if not isinstance(data, dict):
+            raise ValueError("请提交 JSON 对象")
+        if data.get("confirmed") is not True:
+            raise ValueError("导出前必须明确确认")
+        credential_ids = data.get("credential_ids", [])
+        account_ids = data.get("account_ids", [])
+        if not isinstance(credential_ids, list) or not isinstance(account_ids, list):
+            raise ValueError("凭证和账号 ID 必须使用数组")
+        if not credential_ids and not account_ids:
+            raise ValueError("请至少选择一个凭证")
+        if len(credential_ids) + len(account_ids) > 100:
+            raise OverflowError("每次最多导出 100 个凭证")
+        if any(not isinstance(value, str) or not value.strip() for value in credential_ids):
+            raise ValueError("凭证 ID 格式无效")
+        if any(not isinstance(value, str) or not value.strip() for value in account_ids):
+            raise ValueError("账号 ID 格式无效")
+
+        exportable = {
+            str(item.get("id") or "").strip().lower(): item
+            for item in artifact_store.list_credentials()
+            if item.get("exportable") and item.get("id")
+        }
+        selected: dict[str, tuple[Path, str]] = {}
+        for raw_id in credential_ids:
+            artifact_id = raw_id.strip().lower()
+            if artifact_id not in exportable:
+                raise KeyError("所选凭证不存在或不可导出")
+            path = artifact_store.exportable_credential_file(artifact_id)
+            if path is None:
+                raise KeyError("所选凭证不存在或不可导出")
+            selected[str(path.resolve())] = (path, path.name)
+        for raw_id in account_ids:
+            account = mailbox_store.get_secret(account_id=raw_id.strip())
+            if account is None:
+                raise KeyError("所选账号不存在")
+            email = str(account.get("email") or "")
+            credential = artifact_store.exportable_credential_for_email(email)
+            if not credential:
+                raise KeyError("所选账号没有可导出的 OAuth 凭证")
+            path = artifact_store.exportable_credential_file(
+                str(credential.get("id") or ""), expected_email=email
+            )
+            if path is None:
+                raise KeyError("所选账号的 OAuth 凭证不可用")
+            selected[str(path.resolve())] = (path, path.name)
+        return list(selected.values())
+
+    def _selection_error(exc: Exception):
+        if isinstance(exc, OverflowError):
+            return jsonify({"ok": False, "error": str(exc)}), 413
+        if isinstance(exc, KeyError):
+            return jsonify({"ok": False, "error": str(exc).strip("'")}), 404
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    def _sub2api_payload(rows: list[tuple[Path, str]]) -> dict:
+        accounts = []
+        for path, _ in rows:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"凭证文件读取失败：{path.name}") from exc
+            if not isinstance(raw, dict):
+                raise ValueError(f"凭证文件格式无效：{path.name}")
+            credentials = {}
+            for source_key, target_key in (
+                ("access_token", "access_token"),
+                ("refresh_token", "refresh_token"),
+                ("id_token", "id_token"),
+                ("account_id", "chatgpt_account_id"),
+                ("email", "email"),
+                ("plan_type", "plan_type"),
+            ):
+                value = raw.get(source_key)
+                if value is not None and str(value).strip():
+                    credentials[target_key] = value
+            expires_at = raw.get("expired") or raw.get("expires_at")
+            if expires_at:
+                credentials["expires_at"] = expires_at
+            raw_type = str(raw.get("type") or "").strip().lower()
+            if "plan_type" not in credentials and raw_type in {
+                "free",
+                "plus",
+                "pro",
+                "team",
+                "business",
+                "enterprise",
+            }:
+                credentials["plan_type"] = raw_type
+            if not credentials.get("access_token") and not credentials.get("refresh_token"):
+                raise ValueError(f"凭证缺少可用 OAuth Token：{path.name}")
+            email = str(raw.get("email") or path.stem).strip()
+            accounts.append(
+                {
+                    "name": email,
+                    "platform": "openai",
+                    "type": "oauth",
+                    "credentials": credentials,
+                    "extra": {},
+                    "concurrency": 1,
+                    "priority": 50,
+                }
+            )
+        return {
+            "type": "sub2api-data",
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "proxies": [],
+            "accounts": accounts,
+        }
+
     @app.get("/api/artifacts/credentials.zip")
     def download_all_credentials():
         blocked = _download_guard()
@@ -603,60 +717,60 @@ def create_app(
     def download_selected_credentials():
         if not _is_loopback_host(settings.host):
             return jsonify({"ok": False, "error": "敏感文件仅允许从本机监听的 WebUI 下载"}), 403
+        try:
+            rows = _selected_credential_files(request.get_json(silent=True))
+        except (ValueError, KeyError, OverflowError) as exc:
+            return _selection_error(exc)
+        return _zip_download(rows, filename="codex-selected-credentials.zip")
+
+    @app.post("/api/artifacts/credentials/selected/export")
+    def export_selected_credentials():
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "敏感文件仅允许从本机监听的 WebUI 下载"}), 403
         data = request.get_json(silent=True)
-        if not isinstance(data, dict):
-            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
-        if data.get("confirmed") is not True:
-            return jsonify({"ok": False, "error": "下载前必须明确确认"}), 400
-
-        credential_ids = data.get("credential_ids", [])
-        account_ids = data.get("account_ids", [])
-        if not isinstance(credential_ids, list) or not isinstance(account_ids, list):
-            return jsonify({"ok": False, "error": "凭证和账号 ID 必须使用数组"}), 400
-        if not credential_ids and not account_ids:
-            return jsonify({"ok": False, "error": "请至少选择一个凭证"}), 400
-        if len(credential_ids) + len(account_ids) > 100:
-            return jsonify({"ok": False, "error": "每次最多导出 100 个凭证"}), 413
-        if any(not isinstance(value, str) or not value.strip() for value in credential_ids):
-            return jsonify({"ok": False, "error": "凭证 ID 格式无效"}), 400
-        if any(not isinstance(value, str) or not value.strip() for value in account_ids):
-            return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
-
-        exportable = {
-            str(item.get("id") or "").strip().lower(): item
-            for item in artifact_store.list_credentials()
-            if item.get("exportable") and item.get("id")
-        }
-        selected: dict[str, tuple[Path, str]] = {}
-
-        for raw_id in credential_ids:
-            artifact_id = raw_id.strip().lower()
-            if artifact_id not in exportable:
-                return jsonify({"ok": False, "error": "所选凭证不存在或不可导出"}), 404
-            path = artifact_store.exportable_credential_file(artifact_id)
-            if path is None:
-                return jsonify({"ok": False, "error": "所选凭证不存在或不可导出"}), 404
-            selected[str(path.resolve())] = (path, path.name)
-
-        for raw_id in account_ids:
-            account = mailbox_store.get_secret(account_id=raw_id.strip())
-            if account is None:
-                return jsonify({"ok": False, "error": "所选账号不存在"}), 404
-            email = str(account.get("email") or "")
-            credential = artifact_store.exportable_credential_for_email(email)
-            if not credential:
-                return jsonify({"ok": False, "error": "所选账号没有可导出的 OAuth 凭证"}), 404
-            path = artifact_store.exportable_credential_file(
-                str(credential.get("id") or ""), expected_email=email
-            )
-            if path is None:
-                return jsonify({"ok": False, "error": "所选账号的 OAuth 凭证不可用"}), 404
-            selected[str(path.resolve())] = (path, path.name)
-
-        return _zip_download(
-            list(selected.values()),
-            filename="codex-selected-credentials.zip",
+        try:
+            rows = _selected_credential_files(data)
+        except (ValueError, KeyError, OverflowError) as exc:
+            return _selection_error(exc)
+        export_format = str((data or {}).get("format") or "codex_json").strip().lower()
+        if export_format == "codex_json":
+            return _zip_download(rows, filename="codex-selected-credentials.zip")
+        if export_format != "sub2api":
+            return jsonify({"ok": False, "error": "不支持的凭证导出格式"}), 400
+        try:
+            payload = _sub2api_payload(rows)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        return send_file(
+            io.BytesIO(content),
+            mimetype="application/json",
+            as_attachment=True,
+            download_name="sub2api-accounts.json",
+            conditional=False,
+            etag=False,
+            max_age=0,
         )
+
+    @app.delete("/api/artifacts/credentials/selected")
+    def delete_selected_credentials():
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "敏感文件仅允许从本机 WebUI 管理"}), 403
+        data = request.get_json(silent=True)
+        try:
+            rows = _selected_credential_files(data)
+            ids_by_path = {}
+            for item in artifact_store.list_credentials():
+                if not item.get("exportable") or not item.get("id"):
+                    continue
+                credential_path = artifact_store.credential_file(str(item.get("id") or ""))
+                if credential_path is not None:
+                    ids_by_path[str(credential_path.resolve())] = str(item.get("id") or "")
+            artifact_ids = [ids_by_path[str(path.resolve())] for path, _ in rows]
+            deleted = artifact_store.delete_credentials(artifact_ids)
+        except (ValueError, KeyError, OverflowError, OSError) as exc:
+            return _selection_error(exc)
+        return jsonify({"ok": True, "deleted": deleted})
 
     @app.get("/api/artifacts/logs.zip")
     def download_all_logs():
@@ -706,6 +820,75 @@ def create_app(
         if not credential:
             return jsonify({"ok": False, "error": "Hero SMS 尚未保存 API Key"}), 404
         return jsonify({"ok": True, "credential": credential})
+
+    @app.post("/api/accounts/selected/export")
+    def export_selected_accounts():
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "账号素材仅允许从本机监听的 WebUI 下载"}), 403
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "导出前必须明确确认"}), 400
+        account_ids = data.get("account_ids", [])
+        if not isinstance(account_ids, list) or not account_ids:
+            return jsonify({"ok": False, "error": "请至少选择一个账号"}), 400
+        if len(account_ids) > 500:
+            return jsonify({"ok": False, "error": "每次最多导出 500 个账号"}), 413
+        if any(not isinstance(value, str) or not value.strip() for value in account_ids):
+            return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
+        try:
+            grouped = mailbox_store.export_original(account_ids)
+        except (ValueError, KeyError) as exc:
+            return _selection_error(exc)
+        buffer = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for source, lines in grouped.items():
+                content = ("\n".join(lines) + "\n").encode("utf-8")
+                archive.writestr(f"{source}.txt", content)
+            archive.writestr(
+                "README.txt",
+                "每个 TXT 文件均保持对应的原导入格式；在 WebUI 选择同名登录素材类型后可直接重新导入。\n".encode(
+                    "utf-8"
+                ),
+            )
+        buffer.seek(0)
+        response = send_file(
+            buffer,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name="account-materials-original-format.zip",
+            conditional=False,
+            etag=False,
+            max_age=0,
+        )
+        response.call_on_close(buffer.close)
+        return response
+
+    @app.delete("/api/accounts/selected")
+    def delete_selected_accounts():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "删除前必须明确确认"}), 400
+        account_ids = data.get("account_ids", [])
+        if not isinstance(account_ids, list) or not account_ids:
+            return jsonify({"ok": False, "error": "请至少选择一个账号"}), 400
+        if len(account_ids) > 500:
+            return jsonify({"ok": False, "error": "每次最多删除 500 个账号"}), 413
+        accounts = []
+        for account_id in account_ids:
+            if not isinstance(account_id, str) or not account_id.strip():
+                return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
+            account = mailbox_store.get_secret(account_id=account_id.strip())
+            if account is None:
+                return jsonify({"ok": False, "error": "所选账号不存在"}), 404
+            accounts.append(account)
+        active = getattr(codex_manager, "is_account_active", None)
+        if callable(active) and any(active(str(account.get("email") or "")) for account in accounts):
+            return jsonify({"ok": False, "error": "所选账号中有正在运行的任务"}), 409
+        try:
+            deleted = mailbox_store.delete_many(account_ids)
+        except (ValueError, KeyError) as exc:
+            return _selection_error(exc)
+        return jsonify({"ok": True, "deleted": deleted})
 
     @app.delete("/api/accounts/<account_id>")
     def delete_account(account_id: str):

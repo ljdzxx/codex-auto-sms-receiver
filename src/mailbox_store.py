@@ -9,7 +9,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .totp_auth import normalize_totp_secret
 
@@ -166,6 +166,7 @@ class MailboxStore:
                         "password": parts[1],
                         "client_id": parts[2],
                         "refresh_token": parts[3],
+                        "import_material": line,
                     }
                 )
             elif source in _URL_OTP_SOURCES:
@@ -181,7 +182,9 @@ class MailboxStore:
                 except ValueError:
                     invalid += 1
                     continue
-                parsed.append({"email": parts[0], "code_url": code_url})
+                parsed.append(
+                    {"email": parts[0], "code_url": code_url, "import_material": line}
+                )
             else:
                 if len(parts) != 3 or not all(parts):
                     invalid += 1
@@ -196,6 +199,7 @@ class MailboxStore:
                         "email": parts[0],
                         "password": parts[1],
                         "totp_secret": totp_secret,
+                        "import_material": line,
                     }
                 )
         if not parsed:
@@ -217,7 +221,14 @@ class MailboxStore:
                     "codex_message": "",
                     "credential_path": None,
                 }
-                for key in ("password", "client_id", "refresh_token", "code_url", "totp_secret"):
+                for key in (
+                    "password",
+                    "client_id",
+                    "refresh_token",
+                    "code_url",
+                    "totp_secret",
+                    "import_material",
+                ):
                     record.pop(key, None)
                 record.update(item)
                 record["source"] = source
@@ -229,6 +240,82 @@ class MailboxStore:
                     inserted += 1
             self._write(records)
         return {"parsed": len(parsed), "inserted": inserted, "updated": updated, "invalid": invalid}
+
+    @staticmethod
+    def _original_material(record: Mapping) -> str:
+        """Return a re-importable line in the account's original source format."""
+
+        preserved = str(record.get("import_material") or "").strip()
+        if preserved:
+            return preserved
+        email = str(record.get("email") or "").strip()
+        source = str(record.get("source") or "").strip().lower()
+        if source == "outlook":
+            return "----".join(
+                (
+                    email,
+                    str(record.get("password") or ""),
+                    str(record.get("client_id") or ""),
+                    str(record.get("refresh_token") or ""),
+                )
+            )
+        if source == "password_totp":
+            return "|".join(
+                (
+                    email,
+                    str(record.get("password") or ""),
+                    str(record.get("totp_secret") or ""),
+                )
+            )
+        if source in _URL_OTP_SOURCES:
+            code_url = str(record.get("code_url") or "").strip()
+            material = code_url
+            if source == "generic_api":
+                try:
+                    parsed = urlsplit(code_url)
+                    if (
+                        parsed.scheme.casefold() == "https"
+                        and parsed.netloc.casefold() == "icloud.xbovo.online"
+                        and parsed.path == "/api/v1/code"
+                    ):
+                        values = parse_qs(parsed.query)
+                        if values.get("key"):
+                            material = values["key"][0]
+                except ValueError:
+                    pass
+            return f"{email}----{material}"
+        return email
+
+    def export_original(self, account_ids: list[str]) -> dict[str, list[str]]:
+        """Group selected account materials by import source without exposing them to list APIs."""
+
+        normalized = [str(value or "").strip() for value in account_ids]
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("请至少选择一个账号")
+        with self._lock:
+            records = self._read()
+            missing = [value for value in normalized if value not in records]
+            if missing:
+                raise KeyError("所选账号不存在")
+            grouped: dict[str, list[str]] = {}
+            for account_id in normalized:
+                record = records[account_id]
+                source = str(record.get("source") or "unknown").strip().lower()
+                grouped.setdefault(source, []).append(self._original_material(record))
+            return grouped
+
+    def delete_many(self, account_ids: list[str]) -> int:
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("请至少选择一个账号")
+        with self._lock:
+            records = self._read()
+            if any(value not in records for value in normalized):
+                raise KeyError("所选账号不存在")
+            for account_id in normalized:
+                del records[account_id]
+            self._write(records)
+        return len(normalized)
 
     def update_codex(
         self,

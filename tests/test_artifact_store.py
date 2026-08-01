@@ -4,6 +4,8 @@ import json
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from src.artifact_store import ArtifactStore
 
 
@@ -85,6 +87,24 @@ def test_artifact_ids_resolve_only_known_files(tmp_path: Path):
     assert store.exportable_credential_file(
         credential_id, expected_email="different@example.com"
     ) is None
+
+
+def test_delete_credentials_only_removes_resolved_exportable_files(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    credential_dir = data_dir / "codex_accounts"
+    credential_dir.mkdir(parents=True)
+    credential = credential_dir / "codex-owner.json"
+    credential.write_text(
+        json.dumps({"type": "codex", "email": "owner@example.com", "access_token": "secret"}),
+        encoding="utf-8",
+    )
+    store = ArtifactStore(data_dir, tmp_path / "logs")
+    artifact_id = store.list_credentials()[0]["id"]
+
+    assert store.delete_credentials([artifact_id]) == 1
+    assert not credential.exists()
+    with pytest.raises(KeyError):
+        store.delete_credentials([artifact_id])
 
 
 def test_log_view_maps_severity_groups_continuations_and_pagination(tmp_path: Path):

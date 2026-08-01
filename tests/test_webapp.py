@@ -399,7 +399,11 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert 'id="selectAllCredentials"' in html
     assert 'id="clearCredentialSelection"' in html
     assert 'id="downloadSelectedCredentials"' in html
-    assert "/api/artifacts/credentials/selected.zip" in html
+    assert "/api/artifacts/credentials/selected/export" in html
+    assert '<option value="sub2api">Sub2API 导入 JSON</option>' in html
+    assert 'id="exportSelectedAccounts"' in html
+    assert 'id="deleteSelectedAccounts"' in html
+    assert 'id="deleteSelectedCredentials"' in html
     assert "不执行注册" not in html
     assert html.index('id="importPanel"') < html.index('id="pipelineCard"')
     assert html.index('id="pipelineCard"') < html.index('id="accounts"')
@@ -795,6 +799,64 @@ def test_selected_credential_archive_accepts_only_exportable_ids(workspace_path:
         ).status_code
         == 413
     )
+
+    sub2api = client.post(
+        "/api/artifacts/credentials/selected/export",
+        json={
+            "confirmed": True,
+            "format": "sub2api",
+            "credential_ids": [by_email["first@example.com"]["id"]],
+        },
+    )
+    assert sub2api.status_code == 200
+    payload = json.loads(sub2api.data)
+    assert payload["type"] == "sub2api-data"
+    assert payload["version"] == 1
+    assert payload["proxies"] == []
+    assert payload["accounts"][0]["platform"] == "openai"
+    assert payload["accounts"][0]["type"] == "oauth"
+    assert payload["accounts"][0]["credentials"]["access_token"] == "first-secret"
+
+    removed = client.delete(
+        "/api/artifacts/credentials/selected",
+        json={
+            "confirmed": True,
+            "credential_ids": [by_email["first@example.com"]["id"]],
+        },
+    )
+    assert removed.status_code == 200
+    assert removed.get_json()["deleted"] == 1
+    assert by_email["first@example.com"]["id"] not in {
+        item["id"] for item in client.get("/api/artifacts").get_json()["credentials"]
+    }
+
+
+def test_account_management_exports_original_formats_and_batch_deletes(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    outlook = "mail@example.com====mail-pass====client-id====refresh-token"
+    code_url = "code@example.com----https://mail.test/code"
+    mailbox.import_text("outlook", outlook)
+    mailbox.import_text("code_url", code_url)
+    accounts = client.get("/api/accounts").get_json()["accounts"]
+    account_ids = [item["id"] for item in accounts]
+
+    exported = client.post(
+        "/api/accounts/selected/export",
+        json={"confirmed": True, "account_ids": account_ids},
+    )
+    assert exported.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(exported.data)) as archive:
+        assert set(archive.namelist()) == {"outlook.txt", "code_url.txt", "README.txt"}
+        assert archive.read("outlook.txt").decode("utf-8").strip() == outlook
+        assert archive.read("code_url.txt").decode("utf-8").strip() == code_url
+
+    deleted = client.delete(
+        "/api/accounts/selected",
+        json={"confirmed": True, "account_ids": account_ids},
+    )
+    assert deleted.status_code == 200
+    assert deleted.get_json()["deleted"] == 2
+    assert client.get("/api/accounts").get_json()["accounts"] == []
 
 
 def test_log_content_api_is_structured_paginated_and_redacted(workspace_path: Path):
