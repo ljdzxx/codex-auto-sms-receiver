@@ -858,6 +858,9 @@ _GCASH_TOKEN_URL = "https://chatgpt.com/api/auth/session"
 _GCASH_START_TIMEOUT = 60.0
 _GCASH_RUN_TIMEOUT = 1200.0
 _GCASH_POLL_SECONDS = 3.0
+# Heartbeat cadence for the otherwise-silent 提炼 wait, so the operator can see
+# what the 153 page is stuck on instead of staring at a dead log.
+_GCASH_PROGRESS_LOG_SECONDS = 15.0
 _GCASH_FAILED_TOKEN = "gcash_extract_failed"
 _GCASH_PAYMENT_HOSTS = re.compile(r"^https?://([^/]*\.)?(m\.gcash\.com|gcash\.com|checkoutshopper[^/]*\.adyen\.com)", re.I)
 _GCASH_RETURN_URL = re.compile(r"^https?://([^/]*\.)?chatgpt\.com(/|$)", re.I)
@@ -955,8 +958,10 @@ def _wait_for_gcash_outcome(logger, baseline: dict) -> dict:
     success from failure.
     """
     started = False
-    start_deadline = time.time() + _GCASH_START_TIMEOUT
-    run_deadline = time.time() + _GCASH_RUN_TIMEOUT
+    wait_started = time.time()
+    start_deadline = wait_started + _GCASH_START_TIMEOUT
+    run_deadline = wait_started + _GCASH_RUN_TIMEOUT
+    next_progress_log = wait_started + _GCASH_PROGRESS_LOG_SECONDS
     last: dict = dict(baseline)
     baseline_key = _gcash_state_key(baseline)
     while True:
@@ -978,6 +983,28 @@ def _wait_for_gcash_outcome(logger, baseline: dict) -> dict:
                     success = bool(probe.get("result_visible")) and bool(str(probe.get("result_value") or "").strip())
                     return {"success": success, "probe": probe}
         now = time.time()
+        # Heartbeat: the loop can otherwise run up to 20 min with no output, so a
+        # stuck 提炼 looks like a dead hang. Log the current page state on a timer
+        # (probe ok or not) so the operator can see what it is waiting on.
+        if now >= next_progress_log:
+            next_progress_log = now + _GCASH_PROGRESS_LOG_SECONDS
+            waited = int(now - wait_started)
+            if probe.get("ok"):
+                logger.info(
+                    "[gcash] 仍在等待提炼结果（已等 %ds）：percent=%s running=%s stage=%s text=%s result_visible=%s",
+                    waited,
+                    _gcash_percent(last),
+                    bool(last.get("running")),
+                    last.get("progress_stage"),
+                    last.get("progress_text"),
+                    bool(last.get("result_visible")),
+                )
+            else:
+                logger.info(
+                    "[gcash] 仍在等待提炼结果（已等 %ds）：探测未就绪（%s），可能页面正在跳转或被节流",
+                    waited,
+                    str(probe.get("error") or probe.get("tab_url") or "未知")[:160],
+                )
         if not started and now >= start_deadline:
             raise RuntimeError(
                 f"[Codex] {_GCASH_FAILED_TOKEN}：点击「开始提炼」后页面状态一直没有变化"
