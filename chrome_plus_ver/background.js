@@ -61,6 +61,29 @@ async function resolveTargetTab(payload) {
   return tab;
 }
 
+// Defeat background-tab throttling for the gcash 提炼 bound tabs. Chrome throttles
+// setTimeout in a hidden (non-active) tab to ~once/min, which stalls the injected
+// waitFor polling used by page_action/navigate until the 120s bridge timeout —
+// the page appears frozen (stuck on /log-in, TOTP never submitted). Making the
+// pinned tab the ACTIVE tab in its own window clears document.hidden so its timers
+// run at full speed. Deliberately does NOT focus the window (chrome.windows.update
+// focused:true) — that would steal focus from the side panel's window and could
+// throttle the bridge polling instead. Only requests pinned with tab_id (gcash)
+// do this; the normal OAuth pipeline (active-tab driven, no tab_id) is untouched.
+async function foregroundPinnedTab(tab, payload) {
+  const raw = payload && payload.tab_id;
+  const pinned = raw !== undefined && raw !== null && raw !== '';
+  if (!pinned || !tab || typeof tab.id !== 'number' || tab.active) {
+    return;
+  }
+  try {
+    await chrome.tabs.update(tab.id, { active: true });
+  } catch (_e) {
+    // A tab mid-navigation may briefly reject activation; the step's own waitFor
+    // still runs (possibly throttled this once) and later steps retry.
+  }
+}
+
 function normalizeOrigins(input, activeTabUrl) {
   const origins = new Set();
   for (const raw of [...(Array.isArray(input) ? input : []), activeTabUrl]) {
@@ -514,6 +537,7 @@ async function waitForTabComplete(tabId, timeoutMs = 45000) {
 
 async function navigateActiveTab(payload) {
   const tab = await resolveTargetTab(payload);
+  await foregroundPinnedTab(tab, payload);
   await chrome.tabs.update(tab.id, { url: String(payload?.url || '') });
   const updated = await waitForTabComplete(tab.id);
   return {
@@ -1182,6 +1206,7 @@ function gcashProbeInPage() {
 async function runGcashAction(payload) {
   const action = String(payload?.action || '');
   const tab = await resolveTargetTab(payload);
+  await foregroundPinnedTab(tab, payload);
   const blocker = tabInjectionBlocker(String(tab.url || tab.pendingUrl || ''));
   if (blocker) {
     return { ok: false, error: `「153 提炼」标签页无法注入：${blocker}` };
@@ -1197,6 +1222,7 @@ async function runGcashAction(payload) {
 
 async function executePageStep(step) {
   const tab = await resolveTargetTab(step);
+  await foregroundPinnedTab(tab, step);
   const action = String(step?.action || '');
   const isFinalize = action === 'finalize_and_get_callback';
   // finalize survives several cross-page navigations; each one can surface as
