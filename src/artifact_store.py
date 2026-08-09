@@ -745,7 +745,7 @@ class ArtifactStore:
 
     def list_credentials(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for path, relative in self._files(self.credential_dir, "*.json", recursive=False):
+        for path, relative in self._files(self.credential_dir, "*.json", recursive=True):
             try:
                 stat = path.stat()
             except OSError:
@@ -803,7 +803,7 @@ class ArtifactStore:
         if len(artifact_id) != 24 or any(character not in "0123456789abcdef" for character in artifact_id):
             return None
         if kind == "credential":
-            root, pattern, recursive = self.credential_dir, "*.json", False
+            root, pattern, recursive = self.credential_dir, "*.json", True
         elif kind == "log":
             root, pattern, recursive = self.log_dir, "*.log", True
         else:
@@ -1407,10 +1407,14 @@ class ArtifactStore:
         }
 
     def exportable_credential_files(self) -> list[tuple[Path, str]]:
-        metadata_by_name = {item["name"]: item for item in self.list_credentials()}
+        # Key by artifact id (derived from the relative path) rather than the bare
+        # file name — the same account can succeed on different days, producing the
+        # same file name under different {YYYY-MM-DD} subdirs, and name-keying would
+        # collapse them.
+        metadata_by_id = {item["id"]: item for item in self.list_credentials()}
         rows: list[tuple[Path, str]] = []
-        for path, relative in self._files(self.credential_dir, "*.json", recursive=False):
-            metadata = metadata_by_name.get(path.name)
+        for path, relative in self._files(self.credential_dir, "*.json", recursive=True):
+            metadata = metadata_by_id.get(_artifact_id("credential", relative))
             if metadata and metadata.get("exportable"):
                 rows.append((path, relative))
         return rows

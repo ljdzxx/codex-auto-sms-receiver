@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import io
 import json
+import logging
+import re
 import tempfile
+import time
 import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
-from flask import Flask, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Flask, jsonify, request, send_file
 
 from .artifact_store import ArtifactStore, _redact_log_text
+from .browser_bridge import BrowserBridgeTimeout, browser_bridge
+from .gcash_store import GcashTabStore
 from .hero_catalog import HeroCatalog
 from .hero_pricing import HeroPricingClient, HeroPricingError, filter_price_tiers
+from .hero_sms import SMSBOWER_API_BASE
 from .mailbox_store import MailboxStore
 from .settings import Settings
 from .sms_config import SmsConfigStore, normalize_hero_countries, normalize_price
+
+_EXTENSION_ORIGIN_PREFIXES = ("chrome-extension://", "moz-extension://")
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_EXTENSION_FILE_BYTES = 24 * 1024 * 1024
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -29,6 +41,22 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _is_extension_origin(origin: str) -> bool:
+    value = str(origin or "").strip().lower()
+    return any(value.startswith(prefix) for prefix in _EXTENSION_ORIGIN_PREFIXES)
+
+
+def _safe_download_name(value: str) -> str:
+    name = _CONTROL_CHARACTERS.sub("", Path(str(value or "")).name).strip().strip(". ")
+    if not name:
+        return "download.bin"
+    if len(name) <= 180:
+        return name
+    suffix = Path(name).suffix[:32]
+    stem = Path(name).stem[: max(1, 180 - len(suffix))]
+    return f"{stem}{suffix}"
+
+
 def create_app(
     settings: Settings,
     *,
@@ -37,23 +65,22 @@ def create_app(
     sms_config_store=None,
     hero_catalog=None,
     hero_pricing=None,
+    smsbower_pricing=None,
     artifact_store=None,
     **_legacy,
 ) -> Flask:
     if not _is_loopback_host(settings.host):
         raise ValueError("未启用控制台登录，WEBUI_HOST 必须是本机回环地址")
-    app = Flask(
-        __name__,
-        template_folder=str(settings.project_root / "templates"),
-        static_folder=None,
-    )
+    # 网页版控制台已移除：后端只提供 JSON API，UI 一律使用 Chrome 扩展侧边栏。
+    app = Flask(__name__, template_folder=None, static_folder=None)
     app.config.update(
-        MAX_CONTENT_LENGTH=32 * 1024,
+        MAX_CONTENT_LENGTH=48 * 1024 * 1024,
     )
     mailbox_store = mailbox_store or MailboxStore(settings.data_dir)
     sms_config_store = sms_config_store or SmsConfigStore(settings.project_root / ".env")
     hero_catalog = hero_catalog or HeroCatalog()
     artifact_store = artifact_store or ArtifactStore(settings.data_dir, settings.log_dir)
+    gcash_tab_store = GcashTabStore(settings.data_dir)
     if codex_manager is None:
         from .codex_service import CodexJobManager
 
@@ -161,6 +188,12 @@ def create_app(
 
     @app.after_request
     def _security_headers(response):
+        origin = request.headers.get("Origin", "")
+        if _is_extension_origin(origin):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+            response.headers["Access-Control-Max-Age"] = "600"
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -172,18 +205,169 @@ def create_app(
         )
         return response
 
-    @app.route("/login", methods=["GET", "POST"])
-    @app.route("/logout", methods=["GET", "POST"])
-    def legacy_auth_redirect():
-        return redirect(url_for("index"), code=303)
-
     @app.get("/health")
     def health():
         return jsonify({"ok": True, "service": "codex-auto-sms-receiver"})
 
+    @app.get("/api/extension/bootstrap")
+    def extension_bootstrap():
+        browser_bridge.mark_client_seen()
+        return jsonify(
+            {
+                "ok": True,
+                "backend_origin": f"http://{settings.host}:{settings.port}",
+                "serial_only": True,
+                "max_concurrency": 1,
+                "save_file_max_bytes": _MAX_EXTENSION_FILE_BYTES,
+                "browser_bridge_connected": browser_bridge.client_recently_seen(within_seconds=60),
+                "cleanup_origins": [
+                    "https://chatgpt.com",
+                    "https://auth.openai.com",
+                    "https://openai.com",
+                    "https://platform.openai.com",
+                ],
+                "page_context_domains": [
+                    "chatgpt.com",
+                    "auth.openai.com",
+                    "openai.com",
+                    "platform.openai.com",
+                ],
+            }
+        )
+
+    @app.get("/api/browser-bridge/poll")
+    def browser_bridge_poll():
+        try:
+            wait_timeout = float(request.args.get("wait") or 25)
+        except ValueError:
+            wait_timeout = 25.0
+        browser_bridge.mark_client_seen()
+        payload = browser_bridge.poll_next(wait_timeout=max(0.0, min(wait_timeout, 30.0)))
+        return jsonify({"ok": True, "request": payload})
+
+    @app.post("/api/browser-bridge/respond")
+    def browser_bridge_respond():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        request_id = str(data.get("request_id") or "").strip()
+        if not request_id:
+            return jsonify({"ok": False, "error": "缺少 request_id"}), 400
+        browser_bridge.mark_client_seen()
+        if not browser_bridge.resolve(request_id, data.get("response") if isinstance(data.get("response"), dict) else {}):
+            return jsonify({"ok": False, "error": "浏览器桥接请求不存在或已结束"}), 404
+        return jsonify({"ok": True})
+
+    @app.post("/api/extension/files/save")
+    def extension_save_file():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        filename = _safe_download_name(str(data.get("filename") or "download.bin"))
+        payload = str(data.get("content_base64") or "").strip()
+        if not payload:
+            return jsonify({"ok": False, "error": "缺少文件内容"}), 400
+        try:
+            content = base64.b64decode(payload, validate=True)
+        except ValueError:
+            return jsonify({"ok": False, "error": "文件内容不是有效 Base64"}), 400
+        if len(content) > _MAX_EXTENSION_FILE_BYTES:
+            return jsonify({"ok": False, "error": "文件超过后端保存大小限制"}), 413
+        download_dir = settings.data_dir / "extension-downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        target_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}-{filename}"
+        path = download_dir / target_name
+        path.write_bytes(content)
+        return jsonify(
+            {
+                "ok": True,
+                "file": {
+                    "id": target_name,
+                    "name": filename,
+                    "size": len(content),
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "path": str(path),
+                },
+            }
+        )
+
+    @app.get("/api/extension/debug/dom")
+    def extension_debug_dom():
+        browser_bridge.mark_client_seen()
+        try:
+            result = browser_bridge.request("page_action", {"action": "snapshot_dom"}, timeout=30.0)
+        except BrowserBridgeTimeout as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 504
+        if not isinstance(result, dict):
+            return jsonify({"ok": False, "error": "浏览器桥返回了无效结果"}), 502
+        status_code = 200 if result.get("ok", True) else 409
+        return jsonify(result), status_code
+
+    @app.post("/api/extension/debug/snapshot")
+    def extension_debug_snapshot():
+        """Persist a DOM snapshot the extension captured from a user-picked tab.
+
+        The debug workspace binds a tab by id, so the payload is already scoped
+        to one page; here we only validate it and archive it under ``logs/debug``
+        where the artifact viewer can pick it up like any other ``*.log``.
+        """
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        try:
+            tab_id = int(data.get("tab_id"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "缺少有效的 tab_id"}), 400
+        if tab_id < 0:
+            return jsonify({"ok": False, "error": "缺少有效的 tab_id"}), 400
+        snapshot = data.get("snapshot")
+        if not isinstance(snapshot, dict) or not snapshot:
+            return jsonify({"ok": False, "error": "缺少快照内容"}), 400
+        record = {
+            "tab_id": tab_id,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            **snapshot,
+        }
+        try:
+            text = json.dumps(record, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "快照内容无法序列化"}), 400
+        payload_size = len(text.encode("utf-8"))
+        if payload_size > _MAX_EXTENSION_FILE_BYTES:
+            return jsonify({"ok": False, "error": "快照超过后端保存大小限制"}), 413
+        target_dir = Path(settings.log_dir) / "debug"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        path = target_dir / f"{tab_id}-{stamp}-screenshot.log"
+        # Two snapshots inside the same second must not overwrite each other.
+        attempt = 1
+        while path.exists():
+            attempt += 1
+            path = target_dir / f"{tab_id}-{stamp}-{attempt}-screenshot.log"
+        path.write_text(text, encoding="utf-8")
+        return jsonify(
+            {
+                "ok": True,
+                "file": {
+                    "name": path.name,
+                    "relative_path": f"debug/{path.name}",
+                    "size": payload_size,
+                    "path": str(path),
+                    "saved_at": record["saved_at"],
+                },
+            }
+        )
+
     @app.get("/")
     def index():
-        return render_template("index.html")
+        return jsonify(
+            {
+                "ok": True,
+                "service": "codex-auto-sms-receiver",
+                "ui": "chrome-extension",
+                "hint": "网页控制台已移除，请安装并使用 chrome_plus_ver 扩展侧边栏操作",
+            }
+        )
 
     @app.get("/api/overview")
     def overview():
@@ -237,6 +421,20 @@ def create_app(
             return hero_pricing(api_key)
         return hero_pricing
 
+    def _smsbower_pricing_client(api_key: str):
+        # smsbower reuses the Hero pricing client pointed at its own host/label.
+        if smsbower_pricing is None:
+            return HeroPricingClient(
+                api_key,
+                api_base=SMSBOWER_API_BASE,
+                provider_label="smsbower",
+            )
+        if hasattr(smsbower_pricing, "for_api_key"):
+            return smsbower_pricing.for_api_key(api_key)
+        if callable(smsbower_pricing) and not hasattr(smsbower_pricing, "balance"):
+            return smsbower_pricing(api_key)
+        return smsbower_pricing
+
     def _saved_hero_key() -> str:
         # This is deliberately read from the backend store. Request bodies and
         # query strings can never override or receive the saved API key.
@@ -259,6 +457,73 @@ def create_app(
                 }
             ), 502
         return jsonify({"ok": True, "provider": "hero", "balance": balance})
+
+    @app.get("/api/smsbower/balance")
+    def get_smsbower_balance():
+        # smsbower is a peer channel; its key is read from the backend store the
+        # same way Hero's is, so request bodies can never override it.
+        api_key = sms_config_store.reveal_credential("smsbower")
+        if not api_key:
+            return jsonify({"ok": False, "error": "smsbower API Key 尚未配置"}), 409
+        try:
+            balance = _smsbower_pricing_client(api_key).balance()
+        except HeroPricingError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        except Exception as exc:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": f"smsbower 余额查询失败（{type(exc).__name__}）",
+                }
+            ), 502
+        return jsonify({"ok": True, "provider": "smsbower", "balance": balance})
+
+    @app.post("/api/debug/email-otp")
+    def debug_email_otp():
+        # Debug helper for the "调试" tab: read the latest email OTP for a locally
+        # stored account, reusing the same mailbox providers the OAuth pipeline
+        # uses. The extension drives the browser-side flow (session/sentinel);
+        # only the mailbox read has to happen backend-side.
+        data = request.get_json(silent=True) or {}
+        email = str(data.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "缺少 email"}), 400
+        try:
+            after_ts = float(data.get("after_ts"))
+        except (TypeError, ValueError):
+            after_ts = 0.0
+        if after_ts <= 0:
+            after_ts = time.time() - 180
+        account = mailbox_store.get_secret(email=email)
+        if not account:
+            return jsonify({"ok": False, "error": f"本机未找到账号 {email}，无法读取邮箱 OTP"}), 404
+        source = str(account.get("source") or "").strip().lower()
+        from .upstream_bridge import (
+            _generic_api_otp_provider,
+            _outlook_otp_provider,
+            _wait_for_email_otp,
+        )
+
+        if source == "outlook":
+            otp_provider, cleanup = _outlook_otp_provider(account)
+        elif source in {"generic_api", "code_url"}:
+            otp_provider, cleanup = _generic_api_otp_provider(account)
+        else:
+            return jsonify(
+                {"ok": False, "error": f"账号来源 {source or '未知'} 不支持自动读取邮箱 OTP"}
+            ), 400
+        try:
+            code = _wait_for_email_otp(
+                logging.getLogger(__name__), otp_provider, email, after_ts=after_ts
+            )
+        except Exception as exc:  # surface as JSON for the debug tab
+            return jsonify({"ok": False, "error": f"读取邮箱 OTP 失败：{exc}"}), 502
+        finally:
+            try:
+                cleanup()
+            except Exception:
+                pass
+        return jsonify({"ok": True, "code": str(code).strip()})
 
     @app.route("/api/hero-sms/prices", methods=["GET", "POST"])
     def get_hero_sms_prices():
@@ -813,12 +1078,14 @@ def create_app(
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict) or data.get("confirmed") is not True:
             return jsonify({"ok": False, "error": "必须明确确认显示凭证"}), 400
+        provider = str(data.get("provider") or "hero").strip().lower() or "hero"
         try:
-            credential = sms_config_store.reveal_credential("hero")
+            credential = sms_config_store.reveal_credential(provider)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
         if not credential:
-            return jsonify({"ok": False, "error": "Hero SMS 尚未保存 API Key"}), 404
+            label = "smsbower" if provider == "smsbower" else "Hero SMS"
+            return jsonify({"ok": False, "error": f"{label} 尚未保存 API Key"}), 404
         return jsonify({"ok": True, "credential": credential})
 
     @app.post("/api/accounts/selected/export")
@@ -861,6 +1128,69 @@ def create_app(
             max_age=0,
         )
         response.call_on_close(buffer.close)
+        return response
+
+    @app.get("/api/gcash/tabs")
+    def get_gcash_tabs():
+        return jsonify({"ok": True, "tabs": gcash_tab_store.get()})
+
+    @app.post("/api/gcash/tabs")
+    def save_gcash_tabs():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        try:
+            saved = gcash_tab_store.save(
+                login_tab_id=data.get("login_tab_id"),
+                extract_tab_id=data.get("extract_tab_id"),
+                login_tab_label=str(data.get("login_tab_label") or ""),
+                extract_tab_label=str(data.get("extract_tab_label") or ""),
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, "tabs": saved})
+
+    @app.post("/api/accounts/gcash-export")
+    def export_gcash_results():
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "提炼结果仅允许从本机监听的 WebUI 下载"}), 403
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "导出前必须明确确认"}), 400
+        account_ids = data.get("account_ids", [])
+        if not isinstance(account_ids, list) or not account_ids:
+            return jsonify({"ok": False, "error": "请至少选择一个账号"}), 400
+        if len(account_ids) > 500:
+            return jsonify({"ok": False, "error": "每次最多导出 500 个账号"}), 413
+        if any(not isinstance(value, str) or not value.strip() for value in account_ids):
+            return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
+        try:
+            grouped = mailbox_store.export_gcash(account_ids)
+        except (ValueError, KeyError) as exc:
+            return _selection_error(exc)
+        success = grouped.get("success") or []
+        failed = grouped.get("failed") or []
+        if not success and not failed:
+            return jsonify({"ok": False, "error": "所选账号里没有 gcash 提炼结果"}), 400
+        sections = [
+            "----提炼成功----",
+            "\n".join(success),
+            "",
+            "----提炼失败----",
+            "\n".join(failed),
+            "",
+        ]
+        body = "\n".join(sections).encode("utf-8")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        response = send_file(
+            io.BytesIO(body),
+            mimetype="text/plain; charset=utf-8",
+            as_attachment=True,
+            download_name=f"gcash-extraction-{stamp}.txt",
+            conditional=False,
+            etag=False,
+            max_age=0,
+        )
         return response
 
     @app.delete("/api/accounts/selected")
@@ -919,6 +1249,7 @@ def create_app(
                 concurrency=data.get("concurrency", 1),
                 retry_limit=data.get("retry_limit", 0),
                 retry_backoff_seconds=data.get("retry_backoff_seconds", 30),
+                mode=str(data.get("mode") or "oauth"),
             )
         except Exception as exc:
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
@@ -974,5 +1305,6 @@ def create_app(
     app.extensions["sms_config_store"] = sms_config_store
     app.extensions["hero_catalog"] = hero_catalog
     app.extensions["hero_pricing"] = hero_pricing
+    app.extensions["smsbower_pricing"] = smsbower_pricing
     app.extensions["artifact_store"] = artifact_store
     return app

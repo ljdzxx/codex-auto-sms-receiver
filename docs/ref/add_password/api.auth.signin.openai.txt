@@ -1,0 +1,19 @@
+fetch("https://chatgpt.com/api/auth/signin/openai?connection=password&login_hint=consult.pylons4z%40icloud.com&reauth=password&post_login_password_reset=true&max_age=0&ext-oai-did=93090e24-5cd1-4b50-b34f-3800667555a1", {
+  "headers": {
+    "accept": "*/*",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "content-type": "application/x-www-form-urlencoded",
+    "priority": "u=1, i",
+    "sec-ch-ua": "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin"
+  },
+  "referrer": "https://chatgpt.com/",
+  "body": "callbackUrl=https%3A%2F%2Fchatgpt.com%2F&csrfToken=cba9744e2df2016916c568381653ce43f041a1c64d8a8b0cae085bab4a317553&json=true",
+  "method": "POST",
+  "mode": "cors",
+  "credentials": "include"
+});

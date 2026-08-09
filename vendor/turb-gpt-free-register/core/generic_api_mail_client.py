@@ -20,7 +20,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import quote, unquote_to_bytes, urljoin, urlparse
+from urllib.parse import quote, parse_qs, unquote_to_bytes, urljoin, urlparse
 
 import requests
 
@@ -88,6 +88,130 @@ class _InboxListParser(HTMLParser):
         )
         self._message_id = None
         self._text_parts = []
+
+
+class _CardInboxParser(HTMLParser):
+    """解析 icloud-api.top 这类"直接展示邮件"页面。
+
+    页面结构为若干 ``<div class="card">``，每张卡片含子块
+    ``.fr``(发件人) / ``.su``(主题) / ``.dt``(时间) / ``.bd``(邮件正文)。
+    正文里嵌套完整邮件 HTML，故用 div 深度跟踪出卡片边界，并把卡片内所有
+    文本聚合起来供验证码抽取。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.cards: list[dict[str, str]] = []
+        self._div_depth = 0
+        self._card_depth: int | None = None
+        self._cur: dict[str, list[str]] | None = None
+        self._field: str | None = None
+        self._field_depth: int | None = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.casefold() != "div":
+            return
+        classes = {
+            part.casefold()
+            for part in dict((str(k).casefold(), str(v or "")) for k, v in attrs)
+            .get("class", "")
+            .split()
+        }
+        self._div_depth += 1
+        if self._cur is None:
+            if "card" in classes:
+                self._cur = {"fr": [], "su": [], "dt": [], "all": []}
+                self._card_depth = self._div_depth
+            return
+        if self._field is None:
+            for field in ("fr", "su", "dt"):
+                if field in classes:
+                    self._field = field
+                    self._field_depth = self._div_depth
+                    break
+
+    def handle_data(self, data: str) -> None:
+        if self._cur is None:
+            return
+        text = data.strip()
+        if not text:
+            return
+        self._cur["all"].append(text)
+        if self._field is not None:
+            self._cur[self._field].append(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() != "div" or self._cur is None:
+            return
+        if self._field is not None and self._div_depth == self._field_depth:
+            self._field = None
+            self._field_depth = None
+        if self._div_depth == self._card_depth:
+            self.cards.append(
+                {key: " ".join(parts).strip() for key, parts in self._cur.items()}
+            )
+            self._cur = None
+            self._card_depth = None
+        self._div_depth -= 1
+
+
+def _parse_card_date(text: str) -> float | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    # 去掉尾部时区注释，如 "+0000 (UTC)"。
+    raw = re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip()
+    try:
+        return parsedate_to_datetime(raw).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return _parse_message_timestamp({"date": raw})
+
+
+def _extract_from_card_inbox(
+    html_text: str,
+    after_ts: float | None = None,
+    exclude_codes: "frozenset[str] | set[str] | None" = None,
+) -> tuple[bool, str | None]:
+    """解析卡片式收件箱页面。
+
+    返回 ``(recognized, code)``；recognized=True 时禁止再退回裸正则抽取
+    （那条路径没有新鲜度校验，会误取旧码/占位码，比如 000000）。
+    """
+    if 'class="card"' not in html_text and "class='card'" not in html_text:
+        return False, None
+    parser = _CardInboxParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        return False, None
+    if not parser.cards:
+        return False, None
+
+    newest: tuple[float, str] | None = None
+    for card in parser.cards:
+        context = f"{card.get('su', '')} {card.get('fr', '')} {card.get('all', '')}"
+        # 只认验证码邮件，避免把普通邮件里的数字当验证码。
+        if not _has_otp_context(context):
+            continue
+        code = _extract_code(card.get("all", ""))
+        if not code:
+            continue
+        if exclude_codes and code in exclude_codes:
+            logger.debug("[GenericAPI] 已跳过上一轮已使用过的验证码邮件")
+            continue
+        received_ts = _parse_card_date(card.get("dt", ""))
+        if after_ts is not None:
+            if received_ts is None:
+                logger.debug("[GenericAPI] 卡片邮件缺少可解析时间，已跳过以避免使用旧验证码")
+                continue
+            if received_ts < after_ts - _FRESHNESS_TOLERANCE_SECONDS:
+                logger.debug("[GenericAPI] 已跳过本次发码前的旧验证码邮件")
+                continue
+        if newest is None or (received_ts or 0.0) >= (newest[0] or 0.0):
+            newest = (received_ts or 0.0, code)
+    return True, (newest[1] if newest else None)
 
 
 def _flatten_json(obj) -> str:
@@ -164,6 +288,46 @@ def _origin(url: str) -> tuple[str, str, int | None] | None:
         return parsed.scheme.casefold(), parsed.hostname.casefold(), parsed.port
     except ValueError:
         return None
+
+
+def _weimail_api_url(code_url: str) -> str | None:
+    """把 weimail 取码页 ``/latest?email=X&auth_code=Y`` 换算成后端 JSON 接口。
+
+    该邮箱服务发给用户的是一个 JS 单页（``/latest``），真实邮件数据由前端
+    再去请求 ``/mail-api/{auth_code}/{email}?folder=inbox`` 拿。直接 GET
+    ``/latest`` 只会得到 HTML 外壳、抽不到验证码，因此这里把它重写成后端
+    JSON 接口（与页面 JS 的 apiUrl 逻辑保持一致）。无法识别时返回 None。
+    """
+    try:
+        parsed = urlparse(code_url)
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        return None
+    path = parsed.path.rstrip("/").casefold()
+    # 已经是 /mail-api 直连接口就不再重写。
+    if "/mail-api/" in path:
+        return None
+    if not (path.endswith("/latest") or path == "" or path.endswith("/mail")):
+        return None
+    params = parse_qs(parsed.query)
+
+    def _first(*keys: str) -> str:
+        for key in keys:
+            values = params.get(key)
+            if values and str(values[0]).strip():
+                return str(values[0]).strip()
+        return ""
+
+    email = _first("email", "mail")
+    key = _first("auth_code", "code", "key")
+    if not email or not key:
+        return None
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return (
+        f"{origin}/mail-api/{quote(key, safe='')}/{quote(email, safe='')}"
+        "?folder=inbox"
+    )
 
 
 def _decode_data_uri(value: str) -> str:
@@ -269,12 +433,15 @@ def _parse_message_timestamp(payload) -> float | None:
 def _extract_structured_code_payload(
     text: str,
     after_ts: float | None = None,
+    exclude_codes: "frozenset[str] | set[str] | None" = None,
 ) -> tuple[bool, str | None]:
     """
     解析 ``{ok, code, mail, email, fetched_at}`` 风格的取码响应。
 
     ``fetched_at`` 只是查询时间，不能证明验证码属于本轮登录；启用
     ``after_ts`` 时必须以 mail 或顶层邮件时间字段判断新鲜度。
+    ``exclude_codes`` 内的验证码属于此前已提交过的旧码，OTP 均为一次性，
+    复用必然失败，直接跳过。
     """
     try:
         payload = json.loads(text or "")
@@ -294,6 +461,9 @@ def _extract_structured_code_payload(
     if not code:
         return True, None
     if not _CODE_REGEX.fullmatch(code):
+        return True, None
+    if exclude_codes and code in exclude_codes:
+        logger.debug("[GenericAPI] 已跳过上一轮已使用过的验证码")
         return True, None
     if after_ts is None:
         return True, code
@@ -342,6 +512,7 @@ def _extract_from_web_inbox(
     page_url: str,
     headers: dict[str, str],
     after_ts: float | None = None,
+    exclude_codes: "frozenset[str] | set[str] | None" = None,
 ) -> tuple[bool, str | None]:
     """
     尝试解析网页收件箱。
@@ -388,6 +559,9 @@ def _extract_from_web_inbox(
         code = _extract_code(extractable)
         if not code:
             continue
+        if exclude_codes and code in exclude_codes:
+            logger.debug("[GenericAPI] 已跳过上一轮已使用过的验证码邮件")
+            continue
         if after_ts is None:
             return True, code
 
@@ -408,20 +582,25 @@ def _fetch_current_code(
     code_url: str,
     headers: dict[str, str],
     after_ts: float | None = None,
+    exclude_codes: "frozenset[str] | set[str] | None" = None,
 ) -> str | None:
     """执行一轮安全取码；支持直接响应和网页收件箱。"""
-    if _origin(code_url) is None:
+    # 有些取码服务发的是 JS 单页地址（如 weimail 的 /latest?email=&auth_code=），
+    # 真正的邮件 JSON 在后端接口。先尝试换算成后端接口，抽不到时再回退原地址。
+    fetch_url = _weimail_api_url(code_url) or code_url
+    if _origin(fetch_url) is None:
         raise GenericApiMailError("取码地址必须是有效的 HTTP(S) URL")
-    response = session.get(code_url, headers=headers, timeout=20)
+    response = session.get(fetch_url, headers=headers, timeout=20)
     if response.status_code != 200:
         raise GenericApiMailError(f"取码接口返回 HTTP {response.status_code}")
 
-    page_url = str(getattr(response, "url", "") or code_url)
+    page_url = str(getattr(response, "url", "") or fetch_url)
     if _origin(page_url) is None:
         raise GenericApiMailError("取码页面跳转到了无效地址")
     structured, code = _extract_structured_code_payload(
         response.text or "",
         after_ts=after_ts,
+        exclude_codes=exclude_codes,
     )
     if structured:
         return code
@@ -431,10 +610,24 @@ def _fetch_current_code(
         page_url,
         headers,
         after_ts=after_ts,
+        exclude_codes=exclude_codes,
     )
     if recognized:
         return code
-    return _extract_code(response.text or "")
+    # icloud-api.top 等"直接展示邮件"的卡片式页面：带发件人/主题/时间/正文，
+    # 用专用解析器做 OTP 上下文 + 新鲜度校验，避免退回裸正则误取旧码/占位码。
+    recognized, code = _extract_from_card_inbox(
+        response.text or "",
+        after_ts=after_ts,
+        exclude_codes=exclude_codes,
+    )
+    if recognized:
+        return code
+    code = _extract_code(response.text or "")
+    if code and exclude_codes and code in exclude_codes:
+        logger.debug("[GenericAPI] 已跳过上一轮已使用过的验证码")
+        return None
+    return code
 
 
 def pick_account() -> GenericApiEmailAccount:
@@ -502,6 +695,7 @@ def fetch_latest_otp(
     max_wait: int | None = None,
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
+    exclude_codes: "list[str] | tuple[str, ...] | set[str] | None" = None,
 ) -> str:
     """
     轮询该邮箱配置的 code_url，直到提取到 6 位验证码或超时。
@@ -509,10 +703,15 @@ def fetch_latest_otp(
     settle 机制：首次拿到验证码后不立刻返回，而是继续等 OTP_SETTLE_SECONDS 秒。
     如果期间取码地址返回了不同验证码，则替换候选并重置 settle 倒计时；
     连续 settle 秒没有变化后才返回，避免取到接口缓存中的旧码。
+    ``exclude_codes`` 内为此前已提交过的一次性验证码，直接跳过以免复用旧码。
     """
     account = get_account_context(email)
     if account is None:
         raise GenericApiMailError("通用 API 邮箱不存在或未导入")
+
+    excluded = frozenset(
+        str(c).strip() for c in (exclude_codes or ()) if str(c or "").strip()
+    )
 
     deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
@@ -538,6 +737,7 @@ def fetch_latest_otp(
                     account.code_url,
                     headers,
                     after_ts=after_ts,
+                    exclude_codes=excluded,
                 )
                 if code:
                     now_seen = time.time()

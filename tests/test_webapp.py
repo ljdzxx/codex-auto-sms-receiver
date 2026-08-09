@@ -51,7 +51,7 @@ class FakeCodexManager:
     def pipeline_overview(self):
         return dict(self.pipeline)
 
-    def start_batch(self, emails, *, concurrency, retry_limit, retry_backoff_seconds):
+    def start_batch(self, emails, *, concurrency, retry_limit, retry_backoff_seconds, mode="oauth"):
         self.pipeline = {
             "id": "pipeline-1",
             "status": "running",
@@ -59,6 +59,7 @@ class FakeCodexManager:
             "concurrency": int(concurrency),
             "retry_limit": int(retry_limit),
             "retry_backoff_seconds": int(retry_backoff_seconds),
+            "mode": str(mode),
             "total": len(emails),
             "completed": 0,
             "progress": 0.0,
@@ -132,13 +133,14 @@ def test_console_is_available_without_login(workspace_path: Path):
     client = app.test_client()
     index = client.get("/")
     assert index.status_code == 200
-    assert "账号与任务" in index.get_data(as_text=True)
+    body = index.get_json()
+    assert body["ok"] is True
+    assert body["ui"] == "chrome-extension"
     assert client.get("/api/overview").status_code == 200
+    # 网页控制台（含 /login /logout 兼容跳转）已随 Flask UI 一起移除。
     for path, method in (("/login", "get"), ("/login", "post"), ("/logout", "get"), ("/logout", "post")):
-        response = getattr(client, method)(path, follow_redirects=False)
-        assert response.status_code == 303
-        assert response.headers["Location"].endswith("/")
-    assert not (_settings(workspace_path).project_root / "templates" / "login.html").exists()
+        assert getattr(client, method)(path).status_code == 404
+    assert not (_settings(workspace_path).project_root / "templates").exists()
 
 
 def test_timeline_maps_account_email_and_accounts_include_safe_recent_task(
@@ -372,150 +374,6 @@ def test_health_is_public(workspace_path: Path):
     }
 
 
-def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
-    client, _, _ = _client(workspace_path)
-    response = client.get("/")
-    assert response.status_code == 200
-    html = response.get_data(as_text=True)
-    assert 'id="onboardingGuide"' not in html
-    assert 'id="jobsCard"' not in html
-    assert 'id="jobs"' not in html
-    assert 'id="importLineCount"' in html
-    assert 'id="importPanel" data-workspace="accounts" open' in html
-    assert 'id="importFeedback"' in html
-    assert 'id="openImportFromAccounts"' in html
-    assert 'id="pipelineSettings" open' in html
-    assert "导入已有账号" in html
-    assert '<option value="password_totp">账号密码 + TOTP 2FA</option>' in html
-    assert "email|密码|2FA密钥" in html
-    assert "不是 iCloud 等邮箱的密码" in html
-    assert "动态验证码在本机生成，不读取邮箱" in html
-    assert "Hero SMS 接码" in html
-    assert "批量处理账号" in html
-    assert "账号与任务" in html
-    assert "凭证与统计" in html
-    assert "运行日志" in html
-    assert 'id="credentialSelectedCount"' in html
-    assert 'id="selectAllCredentials"' in html
-    assert 'id="clearCredentialSelection"' in html
-    assert 'id="downloadSelectedCredentials"' in html
-    assert "/api/artifacts/credentials/selected/export" in html
-    assert '<option value="sub2api">Sub2API 导入 JSON</option>' in html
-    assert 'id="exportSelectedAccounts"' in html
-    assert 'id="deleteSelectedAccounts"' in html
-    assert 'id="deleteSelectedCredentials"' in html
-    assert "不执行注册" not in html
-    assert html.index('id="importPanel"') < html.index('id="pipelineCard"')
-    assert html.index('id="pipelineCard"') < html.index('id="accounts"')
-    assert html.count('data-workspace="accounts"') == 3
-    assert response.data.count(b'id="materials"') == 1
-    assert response.data.count(b'id="startPipeline"') == 1
-    element_ids = re.findall(r'\bid="([^"]+)"', html)
-    assert len(element_ids) == len(set(element_ids))
-    assert b'id="toggleSmsCredential"' in response.data
-    assert "Hero SMS API Key" in response.get_data(as_text=True)
-    assert ".hero-provider .hero-service-icon{color:#05251d" in html
-    assert b'id="heroCountrySearch"' in response.data
-    assert b'id="heroCountryOptions"' in response.data
-    assert b'id="heroCountrySelect"' not in response.data
-    assert b'role="combobox"' in response.data
-    assert b'aria-autocomplete="list"' in response.data
-    assert b'aria-haspopup="listbox"' in response.data
-    assert "输入中文或英文国名" in response.get_data(as_text=True)
-    assert b'matchingHeroCountries' in response.data
-    assert b'handleHeroCountrySearchKey' in response.data
-    assert b'id="providerOrder"' not in response.data
-    assert b'GrizzlySMS' not in response.data
-    assert b'id="lApiBase"' not in response.data
-    assert b'id="hApiBase"' not in response.data
-    assert b'id="heroMinPrice"' not in response.data
-    assert b'id="heroMaxPrice"' in response.data
-    assert b'id="heroPreferredPrice"' not in response.data
-    assert b'id="heroAcquirePriority"' not in response.data
-    assert b'id="queryHeroBalance"' in response.data
-    assert b'id="queryHeroOffers"' in response.data
-    assert b'/api/hero-sms/prices' in response.data
-    assert b'id="heroQueuePreview"' in response.data
-    assert b'data-country-drag=' in response.data
-    assert b'draggable="true"' in response.data
-    assert b'reorderHeroCountry' in response.data
-    assert "拖动整条卡片可排序" in html
-    assert "data-drag-label=\"正在拖动：${esc(name)}\"" in html
-    assert "松开放到这里" in html
-    assert "const row=event.target.closest('[data-country-row]')" in html
-    assert ".hero-selected-actions,button,input,select,textarea,a" in html
-    assert b'<details class="hero-advanced" open>' in response.data
-    assert b'id="heroMaxPrice" type="number" min="0" step="0.0001" inputmode="decimal" value="0.11"' in response.data
-    assert b'id="smsMaxRetries" type="number" min="1" max="50" value="10"' in response.data
-    assert b'id="smsCodeWait" type="number" min="30" max="600" value="30"' in response.data
-    assert "国家优先队列" in response.get_data(as_text=True)
-    assert "前一个国家无号时，会自动尝试下一个" in response.get_data(as_text=True)
-    assert "保存并使用此优先队列" in response.get_data(as_text=True)
-    assert "选择服务" not in response.get_data(as_text=True)
-    assert b'id="runtimeConfig"' not in response.data
-    assert b"acquire_priority:'country'" in response.data
-    assert b'data-view="accounts"' in response.data
-    assert b'data-view="sms"' in response.data
-    assert b'data-view="results"' in response.data
-    assert b'data-view="logs"' in response.data
-    assert b'data-view="accounts" aria-current="page"' in response.data
-    assert "<span>⌂</span>" not in html
-    assert "<span>◆</span>" not in html
-    assert "<span>↓</span>" not in html
-    assert "<span>≡</span>" not in html
-    assert b'id="pipelineScope"' in response.data
-    assert b'id="pipelineConcurrency"' in response.data
-    assert b'id="pipelineRetryLimit"' in response.data
-    assert b'id="startPipeline"' in response.data
-    assert b'id="pausePipeline"' in response.data
-    assert b'id="resumePipeline"' in response.data
-    assert b'id="stopPipeline"' in response.data
-    assert b'/api/codex-pipeline' in response.data
-    assert b'id="refreshAll"' not in response.data
-    assert b'action="/logout"' not in response.data
-    assert b'data-codex=' not in response.data
-    assert b'id="downloadAllCredentials"' in response.data
-    assert b'id="downloadAllLogs"' in response.data
-    assert b'id="logFileSelect"' in response.data
-    assert b'id="timelineRecords"' in response.data
-    assert b'id="timelineCountImportant"' in response.data
-    assert b'data-timeline-level="important"' in response.data
-    assert "失败/错误" in response.get_data(as_text=True)
-    assert b"/api/logs/timeline" in response.data
-    assert b"limit:'30'" in response.data
-    assert b'id="rawLogExplorer"' in response.data
-    assert b'id="logAutoRefresh"' not in response.data
-    assert b'id="logFileSearch"' not in response.data
-    assert b'id="logSearch"' in response.data
-    assert b'id="logLevel"' in response.data
-    assert b'<option value="problem">\xe5\x8f\xaa\xe7\x9c\x8b\xe9\x94\x99\xe8\xaf\xaf</option>' in response.data
-    assert b'id="logOrder"' not in response.data
-    assert b'id="logPageSize"' not in response.data
-    assert b'id="logDisplayMode"' not in response.data
-    assert b'id="clearLogSearch"' in response.data
-    assert b'id="logRecords"' in response.data
-    assert b'id="previousLogPage"' in response.data
-    assert b'id="nextLogPage"' in response.data
-    assert b'id="downloadSelectedLog"' in response.data
-    assert b'data-view-log=' not in response.data
-    assert b'/api/artifacts/logs/' in response.data
-    assert b'id="smsStatsCard"' in response.data
-    assert b'id="smsStatsOverview"' in response.data
-    assert b'id="smsCountryStats"' in response.data
-    assert b'id="smsNumberRecords"' in response.data
-    assert b'id="refreshSmsStats"' not in response.data
-    assert b'/api/artifacts/sms-stats' in response.data
-    assert "接码统计" in response.get_data(as_text=True)
-    assert "按国家统计" in response.get_data(as_text=True)
-    assert "完整号码" in response.get_data(as_text=True)
-    assert b'scope="col"' in response.data
-    assert "时间、状态和内容" in response.get_data(as_text=True)
-    assert "OpenTelemetry" not in response.get_data(as_text=True)
-    assert "SeverityNumber" not in response.get_data(as_text=True)
-    assert b"limit:'100'" in response.data
-    assert b"order:'desc'" in response.data
-
-
 def test_hero_catalog_api_returns_named_countries(workspace_path: Path):
     class FakeCatalog:
         def catalog(self):
@@ -630,6 +488,56 @@ def test_hero_balance_and_filtered_price_endpoints_use_saved_backend_key(workspa
     assert body["countries"][0]["tiers"][1]["eligible"] is True
     assert body["countries"][1]["available_in_range"] is False
     assert "backend-only-key" not in prices.get_data(as_text=True)
+
+
+def test_smsbower_balance_endpoint_uses_saved_backend_key(workspace_path: Path):
+    class FakeSmsStore:
+        def snapshot(self):
+            return {}
+
+        def reveal_credential(self, provider):
+            assert provider == "smsbower"
+            return "smsbower-backend-key"
+
+    class FakeSmsbowerPricing:
+        def balance(self):
+            return {"amount": "3.25"}
+
+    app = create_app(
+        _settings(workspace_path),
+        mailbox_store=MailboxStore(workspace_path / "data"),
+        codex_manager=FakeCodexManager(),
+        sms_config_store=FakeSmsStore(),
+        smsbower_pricing=FakeSmsbowerPricing(),
+    )
+    client = app.test_client()
+
+    balance = client.get("/api/smsbower/balance")
+    assert balance.status_code == 200
+    assert balance.get_json()["balance"] == {"amount": "3.25"}
+    assert balance.get_json()["provider"] == "smsbower"
+    assert "smsbower-backend-key" not in balance.get_data(as_text=True)
+
+
+def test_smsbower_balance_endpoint_requires_saved_key(workspace_path: Path):
+    class FakeSmsStore:
+        def snapshot(self):
+            return {}
+
+        def reveal_credential(self, provider):
+            return ""
+
+    app = create_app(
+        _settings(workspace_path),
+        mailbox_store=MailboxStore(workspace_path / "data"),
+        codex_manager=FakeCodexManager(),
+        sms_config_store=FakeSmsStore(),
+    )
+    client = app.test_client()
+
+    response = client.get("/api/smsbower/balance")
+    assert response.status_code == 409
+    assert response.get_json()["ok"] is False
 
 
 def test_artifact_listing_and_confirmed_downloads(workspace_path: Path):
@@ -1036,6 +944,13 @@ def test_sms_config_can_be_saved_without_returning_secret(workspace_path: Path, 
         "HERO_SMS_PREFERRED_PRICE",
         "HERO_SMS_ACQUIRE_PRIORITY",
         "HERO_SMS_REUSE_ENABLED",
+        "SMS_CHANNEL_PRIORITY",
+        "SMSBOWER_API_KEY",
+        "SMSBOWER_COUNTRIES",
+        "SMSBOWER_MIN_PRICE",
+        "SMSBOWER_MAX_PRICE",
+        "SMSBOWER_PREFERRED_PRICE",
+        "SMSBOWER_ACQUIRE_PRIORITY",
     ):
         monkeypatch.delenv(key, raising=False)
     mailbox = MailboxStore(workspace_path / "data")
@@ -1054,12 +969,15 @@ def test_sms_config_can_be_saved_without_returning_secret(workspace_path: Path, 
         json={
             "provider": "hero",
             "countries": ["187", "33"],
+            "country_prices": {
+                "187": {"max": "0.10", "fixed": False},
+                "33": {"max": "0.10", "fixed": True},
+            },
             "service": "dr",
             "min_price": "0.05",
             "max_price": "0.10",
             "preferred_price": "0.075",
             "acquire_priority": "price",
-            "max_retries": 10,
             "code_wait": 120,
             "credential": "hero-secret",
             "clear_credential": False,
@@ -1068,7 +986,7 @@ def test_sms_config_can_be_saved_without_returning_secret(workspace_path: Path, 
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["config"]["credentials_configured"] == {"hero": True}
+    assert body["config"]["credentials_configured"] == {"hero": True, "smsbower": False}
     assert body["config"]["countries"] == ["187", "33"]
     assert "hero-secret" not in response.get_data(as_text=True)
     values = dotenv_values(workspace_path / ".env")
@@ -1094,3 +1012,161 @@ def test_sms_config_rejects_non_hero_provider(workspace_path: Path):
     )
     assert response.status_code == 400
     assert "Hero SMS" in response.get_json()["error"]
+
+
+def _debug_snapshot_payload() -> dict:
+    return {
+        "captured_at": "2026-08-08T00:00:00.000Z",
+        "page": {"url": "https://chatgpt.com/auth/login_with", "title": "登录", "ready_state": "complete"},
+        "elements": [
+            {"index": 0, "tag": "input", "type": "email", "selector": "#email-input", "visible": True},
+            {"index": 1, "tag": "button", "text": "继续", "selector": "form > button", "visible": True},
+        ],
+        "forms": [{"index": 0, "selector": "form", "control_count": 3}],
+        "html": "<html><body>hi</body></html>",
+    }
+
+
+def test_debug_snapshot_is_saved_under_logs_debug(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+
+    response = client.post(
+        "/api/extension/debug/snapshot",
+        json={"tab_id": 482, "snapshot": _debug_snapshot_payload()},
+    )
+
+    assert response.status_code == 200
+    file_info = response.get_json()["file"]
+    assert re.fullmatch(r"482-\d{8}-\d{6}-screenshot\.log", file_info["name"])
+    assert file_info["relative_path"] == f"debug/{file_info['name']}"
+
+    saved = workspace_path / "logs" / "debug" / file_info["name"]
+    assert saved.exists()
+    record = json.loads(saved.read_text(encoding="utf-8"))
+    assert record["tab_id"] == 482
+    assert record["saved_at"]
+    assert record["page"]["url"] == "https://chatgpt.com/auth/login_with"
+    assert record["elements"][0]["selector"] == "#email-input"
+    assert record["html"] == "<html><body>hi</body></html>"
+
+
+def test_debug_snapshot_never_overwrites_a_same_second_capture(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+    payload = {"tab_id": 7, "snapshot": _debug_snapshot_payload()}
+
+    first = client.post("/api/extension/debug/snapshot", json=payload).get_json()["file"]
+    second = client.post("/api/extension/debug/snapshot", json=payload).get_json()["file"]
+
+    assert first["name"] != second["name"]
+    debug_dir = workspace_path / "logs" / "debug"
+    assert len(list(debug_dir.glob("7-*-screenshot.log"))) == 2
+
+
+def test_debug_snapshot_rejects_missing_tab_or_snapshot(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+
+    assert client.post("/api/extension/debug/snapshot", json={"snapshot": {"page": {}}}).status_code == 400
+    assert client.post("/api/extension/debug/snapshot", json={"tab_id": "abc", "snapshot": {"page": {}}}).status_code == 400
+    assert client.post("/api/extension/debug/snapshot", json={"tab_id": 3}).status_code == 400
+    assert client.post("/api/extension/debug/snapshot", json={"tab_id": 3, "snapshot": {}}).status_code == 400
+    assert not (workspace_path / "logs" / "debug").exists()
+
+
+def test_debug_snapshot_shows_up_as_a_downloadable_log_artifact(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+    saved = client.post(
+        "/api/extension/debug/snapshot",
+        json={"tab_id": 12, "snapshot": _debug_snapshot_payload()},
+    ).get_json()["file"]
+
+    artifacts = client.get("/api/artifacts").get_json()
+    row = next(item for item in artifacts["logs"] if item["name"].endswith(saved["name"]))
+
+    assert row["downloadable"] is True
+    assert client.get(f"/api/artifacts/logs/{row['id']}/download?confirmed=1").status_code == 200
+
+
+def _import_generic_account(client, email: str = "gcash.one@icloud.com") -> str:
+    response = client.post(
+        "/api/accounts/import",
+        json={"source": "generic_api", "text": f"{email}----https://mail.example.com/latest?email={email}"},
+    )
+    assert response.status_code == 200
+    accounts = client.get("/api/accounts").get_json()["accounts"]
+    return next(row["id"] for row in accounts if row["email"] == email)
+
+
+def test_gcash_tab_binding_round_trips(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+
+    assert client.get("/api/gcash/tabs").get_json()["tabs"]["login_tab_id"] is None
+
+    saved = client.post(
+        "/api/gcash/tabs",
+        json={"login_tab_id": 11, "extract_tab_id": 22, "login_tab_label": "[11] ChatGPT"},
+    )
+    assert saved.status_code == 200
+    assert saved.get_json()["tabs"]["login_tab_id"] == 11
+
+    reloaded = client.get("/api/gcash/tabs").get_json()["tabs"]
+    assert (reloaded["login_tab_id"], reloaded["extract_tab_id"]) == (11, 22)
+    assert reloaded["login_tab_label"] == "[11] ChatGPT"
+
+
+def test_gcash_tab_binding_rejects_same_or_missing_tab(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+
+    same = client.post("/api/gcash/tabs", json={"login_tab_id": 5, "extract_tab_id": 5})
+    assert same.status_code == 400
+    assert "同一个" in same.get_json()["error"]
+
+    missing = client.post("/api/gcash/tabs", json={"login_tab_id": 5})
+    assert missing.status_code == 400
+    assert client.get("/api/gcash/tabs").get_json()["tabs"]["login_tab_id"] is None
+
+
+def test_gcash_export_groups_success_and_failure_with_access_token(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    good_id = _import_generic_account(client, "gcash.good@icloud.com")
+    bad_id = _import_generic_account(client, "gcash.bad@icloud.com")
+    mailbox.update_gcash("gcash.good@icloud.com", status="success", access_token="token-good")
+    mailbox.update_gcash("gcash.bad@icloud.com", status="failed", access_token="token-bad")
+
+    response = client.post(
+        "/api/accounts/gcash-export",
+        json={"confirmed": True, "account_ids": [good_id, bad_id]},
+    )
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    success_block, failed_block = body.split("----提炼失败----")
+    assert "----提炼成功----" in success_block
+    assert "gcash.good@icloud.com" in success_block and "----token-good" in success_block
+    assert "gcash.bad@icloud.com" not in success_block
+    assert "gcash.bad@icloud.com" in failed_block and "----token-bad" in failed_block
+
+
+def test_gcash_export_requires_confirmation_and_some_result(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+    account_id = _import_generic_account(client, "gcash.none@icloud.com")
+
+    assert client.post("/api/accounts/gcash-export", json={"account_ids": [account_id]}).status_code == 400
+    empty = client.post(
+        "/api/accounts/gcash-export",
+        json={"confirmed": True, "account_ids": [account_id]},
+    )
+    assert empty.status_code == 400
+    assert "没有 gcash 提炼结果" in empty.get_json()["error"]
+
+
+def test_accounts_expose_gcash_status_without_leaking_the_token(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    _import_generic_account(client, "gcash.status@icloud.com")
+    mailbox.update_gcash("gcash.status@icloud.com", status="success", access_token="super-secret-token")
+
+    payload = client.get("/api/accounts").get_json()
+    row = next(item for item in payload["accounts"] if item["email"] == "gcash.status@icloud.com")
+
+    assert row["gcash_status"] == "success"
+    assert row["has_gcash_token"] is True
+    assert "super-secret-token" not in json.dumps(payload)

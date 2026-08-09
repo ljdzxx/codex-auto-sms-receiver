@@ -3,9 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-import multiprocessing
-import os
 import queue
+import os
 import re
 import threading
 import time
@@ -46,8 +45,8 @@ class CodexJobManager:
     _ACTIVE_JOBS = {"queued", "running", "retry_wait"}
     _TERMINAL_JOBS = {"success", "failed", "stopped", "deactivated", "skipped"}
     _ACTIVE_PIPELINES = {"queued", "running", "paused", "stopping"}
-    _MAX_CONCURRENCY = 3
-    _MAX_RETRY_LIMIT = 3
+    _MAX_CONCURRENCY = 1
+    _MAX_RETRY_LIMIT = 99
     _MAX_BATCH_SIZE = 200
 
     def __init__(self, settings: Settings, mailbox_store: MailboxStore):
@@ -60,10 +59,14 @@ class CodexJobManager:
         self._data_dir = Path(getattr(settings, "data_dir", mailbox_store.data_dir))
         self._log_dir = Path(getattr(settings, "log_dir", settings.project_root / "logs"))
         self._state_path = self._data_dir / "pipeline-state.json"
-        self._mp_context = multiprocessing.get_context("spawn")
         self._task_queue = None
         self._result_queue = None
         self._workers: list[Any] = []
+        # Per-job cancellation flags, keyed by job id. A running worker thread
+        # cannot be force-killed in Python, so long manual waits (gcash 扫码)
+        # cooperatively poll this Event to exit promptly when the user stops.
+        # Kept OUT of the job dict because that dict is JSON-persisted/deepcopied.
+        self._cancel_events: dict[str, threading.Event] = {}
         self._load_state()
         self._recover_interrupted()
 
@@ -265,15 +268,30 @@ class CodexJobManager:
         concurrency: int = 1,
         retry_limit: int = 0,
         retry_backoff_seconds: int = 30,
+        mode: str = "oauth",
     ) -> dict[str, Any]:
+        normalized_mode = str(mode or "oauth").strip().lower()
+        export_session = normalized_mode == "session"
+        # "仅登录"：只把选中的账号登录进 chatgpt.com，不导出 Session、不走 OAuth。
+        login_only = normalized_mode == "login"
+        # "gcash 提炼"：登录 → accessToken → 153 提炼 → 付款链接 → 等待扫码。
+        gcash_extract = normalized_mode == "gcash"
+        gcash_tabs: dict[str, Any] = {}
+        if gcash_extract:
+            from .gcash_store import GcashTabStore
+
+            gcash_tabs = GcashTabStore(self._data_dir).get()
+            if gcash_tabs.get("login_tab_id") is None or gcash_tabs.get("extract_tab_id") is None:
+                raise ValueError("请先在插件「调试」页绑定「ChatGPT登录」和「153提炼」两个标签页并保存")
         try:
             concurrency = int(concurrency)
             retry_limit = int(retry_limit)
             retry_backoff_seconds = int(retry_backoff_seconds)
         except (TypeError, ValueError) as exc:
             raise ValueError("流水线并发和重试参数必须是整数") from exc
-        if concurrency < 1 or concurrency > self._MAX_CONCURRENCY:
+        if concurrency < 1:
             raise ValueError(f"任务并发必须在 1 - {self._MAX_CONCURRENCY} 之间")
+        concurrency = 1
         if retry_limit < 0 or retry_limit > self._MAX_RETRY_LIMIT:
             raise ValueError(f"失败重试必须在 0 - {self._MAX_RETRY_LIMIT} 之间")
         if retry_backoff_seconds < 5 or retry_backoff_seconds > 600:
@@ -291,6 +309,8 @@ class CodexJobManager:
             raise ValueError("请至少选择 1 个账号")
         if len(normalized) > self._MAX_BATCH_SIZE:
             raise ValueError(f"单批最多处理 {self._MAX_BATCH_SIZE} 个账号")
+        if login_only and len(normalized) != 1:
+            raise ValueError("仅登录模式一次只能选择 1 个账号")
         availability = self.availability()
         if not availability["available"]:
             raise RuntimeError(availability["reason"])
@@ -302,9 +322,25 @@ class CodexJobManager:
                 raise ValueError(f"账号未导入：{email}")
             if not self._otp_ready(mailbox):
                 raise ValueError(f"邮箱 OTP 配置未就绪：{email}")
+            if export_session:
+                # Signals the worker to also capture chatgpt.com/api/auth/session
+                # after login and save it under data/codex_sessions/{date}/.
+                mailbox = {**mailbox, "export_session": True}
+            elif login_only:
+                # Signals the worker to stop right after a successful login.
+                mailbox = {**mailbox, "login_only": True}
+            elif gcash_extract:
+                # Carries the operator's tab binding into the worker, which has
+                # no access to the extension UI that made the choice.
+                mailbox = {
+                    **mailbox,
+                    "gcash_extract": True,
+                    "gcash_login_tab_id": int(gcash_tabs["login_tab_id"]),
+                    "gcash_extract_tab_id": int(gcash_tabs["extract_tab_id"]),
+                }
             mailboxes.append(mailbox)
 
-        self._ensure_workers(concurrency)
+        self._ensure_workers(1)
         pipeline_id = uuid.uuid4().hex
         created_at = _now()
         job_mailboxes: dict[str, dict[str, Any]] = {}
@@ -342,6 +378,7 @@ class CodexJobManager:
             self._pipelines[pipeline_id] = {
                 "id": pipeline_id,
                 "status": "queued",
+                "mode": normalized_mode or "oauth",
                 "concurrency": concurrency,
                 "retry_limit": retry_limit,
                 "retry_backoff_seconds": retry_backoff_seconds,
@@ -371,10 +408,10 @@ class CodexJobManager:
         with self._lock:
             self._workers = [worker for worker in self._workers if worker.is_alive()]
             if self._task_queue is None:
-                self._task_queue = self._mp_context.Queue()
-                self._result_queue = self._mp_context.Queue()
+                self._task_queue = queue.Queue()
+                self._result_queue = queue.Queue()
             while len(self._workers) < count:
-                worker = self._mp_context.Process(
+                worker = threading.Thread(
                     target=worker_main,
                     args=(
                         WorkerSettings(
@@ -413,6 +450,11 @@ class CodexJobManager:
             status="running",
             message=f"流水线执行中（第 {attempt}/{job['max_attempts']} 次）",
         )
+        # Fresh cancel flag for this attempt; a retry gets a clean (unset) Event so
+        # an earlier stop can't pre-cancel it. The worker runs in-process (thread),
+        # so the Event object passes through the queue by reference, not pickled.
+        cancel_event = threading.Event()
+        self._cancel_events[job["id"]] = cancel_event
         self._task_queue.put(
             {
                 "dispatch_id": dispatch_id,
@@ -420,6 +462,7 @@ class CodexJobManager:
                 "attempt": attempt,
                 "mailbox": mailbox,
                 "log_path": str(log_path),
+                "cancel_event": cancel_event,
             }
         )
         return dispatch_id
@@ -427,10 +470,26 @@ class CodexJobManager:
     @staticmethod
     def _failure_info(message: str, status: str = "", http_status: Any = None) -> tuple[str, bool, int]:
         text = f"{status} {message}".casefold()
+        # gcash 提炼 failures are terminal for that account: retrying would log
+        # in again and burn another extraction round for the same outcome.
+        # Checked before the generic "超时" rule below, which would otherwise
+        # mark a scan/extraction timeout as retryable.
+        if "gcash_extract_failed" in text:
+            return "gcash_extract_failed", False, 0
+        # Dead/removed account (OpenAI 身份验证错误 · account_deactivated) — the
+        # email itself is unusable, retrying only burns SMS numbers. Mark it so
+        # _handle_result_locked ends the job as "deactivated" instead of failed.
+        if "account_deactivated" in text or "已被删除或停用" in text or "账户已被删除" in text:
+            return "account_deactivated", False, 0
         if "等待通用 api 验证码超时" in text:
             return "mailbox_otp_timeout", True, 15
         if any(value in text for value in ("rate_limit", "too many", "请求过多")):
             return "rate_limited", True, 180
+        # OpenAI transient server-error screens ("糟糕，出错了 / Operation timed
+        # out") and the MV3 bridge going idle ("浏览器桥接超时") are both worth a
+        # retry — the account is fine, the environment hiccuped.
+        if "openai_transient" in text or "浏览器桥接超时" in text or "超时" in text:
+            return "transient_network", True, 0
         if any(
             value in text
             for value in (
@@ -480,6 +539,8 @@ class CodexJobManager:
         return f"+{matches[-1]}" if matches else ""
 
     def _handle_result_locked(self, job: dict[str, Any], response: dict[str, Any], pipeline: dict[str, Any]) -> None:
+        # The attempt has reported back; its cancel flag is spent either way.
+        self._cancel_events.pop(str(job.get("id") or ""), None)
         result = response.get("result") if isinstance(response.get("result"), dict) else {}
         error = str(response.get("error") or "")
         error_type = str(response.get("error_type") or "")
@@ -528,7 +589,7 @@ class CodexJobManager:
             )
             return
 
-        if status in {"deactivated", "skipped"}:
+        if status in {"deactivated", "skipped", "stopped"}:
             job.update(
                 status=status,
                 stage="已结束",
@@ -544,6 +605,22 @@ class CodexJobManager:
             return
 
         failure_code, retryable, minimum_delay = self._failure_info(message, status, http_status)
+        # A dead account (account_deactivated) is terminal — record it as
+        # "deactivated" so the mailbox is flagged and the job is never retried.
+        if failure_code == "account_deactivated":
+            job.update(
+                status="deactivated",
+                stage="账号不可用",
+                message=message[:500],
+                failure_code=failure_code,
+                retryable=False,
+                next_retry_at=None,
+                finished_at=_now(),
+            )
+            self.mailbox_store.update_codex(
+                str(job.get("email") or ""), status="deactivated", message=message[:500]
+            )
+            return
         can_retry = (
             retryable
             and int(job.get("attempt") or 0) < int(job.get("max_attempts") or 1)
@@ -719,6 +796,9 @@ class CodexJobManager:
                 if job and job.get("status") == "running":
                     job["stop_requested"] = True
                     job["message"] = "已停止派发后续任务；当前网络步骤将执行完"
+                    event = self._cancel_events.get(str(job_id))
+                    if event is not None:
+                        event.set()
             self._persist_locked()
             return True
 
@@ -738,6 +818,9 @@ class CodexJobManager:
             else:
                 job["stop_requested"] = True
                 job["message"] = "已请求停止重试；当前网络步骤将执行完"
+                event = self._cancel_events.get(str(job_id or ""))
+                if event is not None:
+                    event.set()
             self._persist_locked()
             return True
 

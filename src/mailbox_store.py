@@ -41,6 +41,41 @@ def _validate_code_url(value: str) -> str:
     raise ValueError("取码地址必须是 HTTP(S) URL")
 
 
+def _split_password_totp(line: str) -> list[str] | None:
+    """Split a ``密码 + TOTP 2FA`` import line into ``[email, password, secret]``.
+
+    Both ``email|password|secret`` and ``email----password----secret`` are
+    accepted, and any extra columns after the secret (备注/其他扩展字段) are
+    ignored instead of failing the line.  The password itself may contain the
+    separator, so candidate layouts are tried in order and the first one whose
+    third column is a valid Base32 secret wins.
+    """
+
+    line = str(line or "")
+    for separator in ("----", "|"):
+        if separator not in line:
+            continue
+        columns = [column.strip() for column in line.split(separator)]
+        if len(columns) < 3:
+            continue
+        candidates = [columns[:3]]
+        if len(columns) > 3:
+            # Legacy tolerance: the password may embed the separator, in which
+            # case the secret is the last column (old first/last "|" behaviour).
+            candidates.append(
+                [columns[0], separator.join(columns[1:-1]).strip(), columns[-1]]
+            )
+        for candidate in candidates:
+            if not all(candidate):
+                continue
+            try:
+                normalize_totp_secret(candidate[2])
+            except ValueError:
+                continue
+            return candidate
+    return None
+
+
 def _generic_code_url(email: str, credential: str) -> str:
     """Accept a full endpoint URL or expand an iCloud mailbox API key."""
 
@@ -99,6 +134,7 @@ class MailboxStore:
             "id": record.get("id"),
             "email": record.get("email"),
             "source": record.get("source"),
+            "signup_password": str(record.get("signup_password") or ""),
             "otp_ready": otp_ready,
             "created_at": record.get("created_at"),
             "updated_at": record.get("updated_at"),
@@ -108,6 +144,12 @@ class MailboxStore:
             "phone_verified": bool(record.get("phone_verified")),
             "phone_number": str(record.get("phone_number") or ""),
             "phone_verified_at": record.get("phone_verified_at"),
+            # gcash 提炼 outcome. The accessToken itself stays private (export
+            # only), the list API just says whether one was captured.
+            "gcash_status": str(record.get("gcash_status") or ""),
+            "gcash_message": str(record.get("gcash_message") or ""),
+            "has_gcash_token": bool(record.get("gcash_access_token")),
+            "gcash_updated_at": record.get("gcash_updated_at"),
         }
 
     def list_accounts(self) -> list[dict]:
@@ -141,16 +183,11 @@ class MailboxStore:
             if not line or line.startswith("#"):
                 continue
             if source == "password_totp":
-                first_separator = line.find("|")
-                last_separator = line.rfind("|")
-                if first_separator <= 0 or last_separator <= first_separator:
+                columns = _split_password_totp(line)
+                if columns is None:
                     invalid += 1
                     continue
-                parts = [
-                    line[:first_separator],
-                    line[first_separator + 1:last_separator],
-                    line[last_separator + 1:],
-                ]
+                parts = columns
             elif source in _URL_OTP_SOURCES:
                 parts = line.split("----", 1) if "----" in line else line.split("====", 1)
             else:
@@ -343,6 +380,80 @@ class MailboxStore:
                     record["phone_verified_at"] = _now()
             if phone_number is not None:
                 record["phone_number"] = str(phone_number or "")
+            record["updated_at"] = _now()
+            self._write(records)
+            return True
+
+    def update_gcash(
+        self,
+        email: str,
+        *,
+        status: str | None = None,
+        access_token: str | None = None,
+        link: str | None = None,
+        message: str | None = None,
+    ) -> bool:
+        """Record gcash 提炼 progress for one account.
+
+        Only the fields that are passed get written, so the accessToken captured
+        at the login step survives a later failure of the extraction step (the
+        export needs it for both groups).
+        """
+        with self._lock:
+            records = self._read()
+            record = records.get(self._id(email))
+            if record is None:
+                return False
+            if status is not None:
+                record["gcash_status"] = str(status or "")
+            if access_token is not None:
+                record["gcash_access_token"] = str(access_token or "")
+            if link is not None:
+                record["gcash_link"] = str(link or "")
+            if message is not None:
+                record["gcash_message"] = str(message or "")
+            record["gcash_updated_at"] = _now()
+            record["updated_at"] = _now()
+            self._write(records)
+            return True
+
+    def export_gcash(self, account_ids: list[str]) -> dict[str, list[str]]:
+        """Group selected accounts' 提炼 results into 成功 / 失败 buckets.
+
+        Each line is the account's original import material with the captured
+        accessToken appended, separated by ``----`` — the same separator the
+        import parser already understands for the leading columns.
+        """
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("请至少选择一个账号")
+        with self._lock:
+            records = self._read()
+            missing = [value for value in normalized if value not in records]
+            if missing:
+                raise KeyError("所选账号不存在")
+            grouped: dict[str, list[str]] = {"success": [], "failed": []}
+            for account_id in normalized:
+                record = records[account_id]
+                status = str(record.get("gcash_status") or "").strip().lower()
+                if status not in {"success", "failed"}:
+                    continue
+                token = str(record.get("gcash_access_token") or "").strip()
+                material = self._original_material(record)
+                grouped[status].append(f"{material}----{token}" if token else material)
+            return grouped
+
+    def update_signup_password(self, email: str, signup_password: str) -> bool:
+        password = str(signup_password or "")
+        if not password:
+            return False
+        with self._lock:
+            records = self._read()
+            account_id = self._id(email)
+            record = records.get(account_id)
+            if record is None:
+                return False
+            record["signup_password"] = password
             record["updated_at"] = _now()
             self._write(records)
             return True

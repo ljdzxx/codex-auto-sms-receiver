@@ -1,0 +1,19 @@
+fetch("https://chatgpt.com/ces/v1/b", {
+  "headers": {
+    "accept": "*/*",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "content-type": "text/plain",
+    "priority": "u=1, i",
+    "sec-ch-ua": "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site"
+  },
+  "referrer": "https://auth.openai.com/",
+  "body": "{\"writeKey\":\"oai\",\"batch\":[{\"timestamp\":\"2026-08-03T15:31:02.033Z\",\"integrations\":{\"Segment.io\":true},\"type\":\"page\",\"properties\":{\"path\":\"/email-verification\",\"referrer\":\"redacted\",\"search\":\"redacted\",\"title\":\"请先验证是你本人 - OpenAI\",\"url\":\"redacted\",\"route_id\":\"EMAIL_VERIFICATION\",\"is_error\":false,\"origin\":\"login-web\",\"category\":\"Identity\",\"name\":\"Email Verification\"},\"category\":\"Identity\",\"name\":\"Email Verification\",\"context\":{\"page\":{\"path\":\"/email-verification\",\"referrer\":\"redacted\",\"search\":\"redacted\",\"title\":\"请先验证是你本人 - OpenAI\",\"url\":\"redacted\"},\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36\",\"userAgentData\":{\"brands\":[{\"brand\":\"Not;A=Brand\",\"version\":\"8\"},{\"brand\":\"Chromium\",\"version\":\"150\"},{\"brand\":\"Google Chrome\",\"version\":\"150\"}],\"mobile\":false,\"platform\":\"Windows\"},\"locale\":\"zh-CN\",\"library\":{\"name\":\"analytics.js\",\"version\":\"npm:next-1.81.1\"},\"campaign\":{},\"timezone\":\"Asia/Shanghai\",\"app_name\":\"login_web\",\"app_version\":\"e99450f6cac319c980b6e708fa202df597b0e903\",\"device_id\":\"93090e24-5cd1-4b50-b34f-3800667555a1\",\"oaicom_stable_id\":\"c9618a47-7572-457d-80dc-27463f69d24a\",\"auth_session_logging_id\":\"server_b058422b-39a6-4d29-ad95-f017dbcd0178\",\"openai_client_id\":\"app_X8zY6vW2pQ9tR3dE7nK1jL5gH\",\"app_name_enum\":\"chat\"},\"messageId\":\"ajs-next-1785771062033-5fc649f4-94ce-4bf3-b652-d6be53eba19a\",\"anonymousId\":\"c649f494-ce5b-43f6-92d6-be53eba19ae5\",\"writeKey\":\"oai\",\"userId\":null,\"_metadata\":{\"bundled\":[\"Segment.io\"],\"unbundled\":[],\"bundledIds\":[]}}],\"sentAt\":\"2026-08-03T15:31:08.052Z\"}",
+  "method": "POST",
+  "mode": "cors",
+  "credentials": "omit"
+});

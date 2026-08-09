@@ -1,0 +1,19 @@
+fetch("https://sentinel.openai.com/backend-api/sentinel/req", {
+  "headers": {
+    "accept": "*/*",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "content-type": "text/plain;charset=UTF-8",
+    "priority": "u=1, i",
+    "sec-ch-ua": "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin"
+  },
+  "referrer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+  "body": "{\"p\":\"gAAAAACWzQwMDAsIk1vbiBBdWcgMDMgMjAyNiAyMzozMTowOSBHTVQrMDgwMCAo5Lit5Zu95qCH5YeG5pe26Ze0KSIsNDM3MDQ2NDc2OCw0LCJNb3ppbGxhLzUuMCAoV2luZG93cyBOVCAxMC4wOyBXaW42NDsgeDY0KSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBDaHJvbWUvMTUwLjAuMC4wIFNhZmFyaS81MzcuMzYiLCJodHRwczovL3NlbnRpbmVsLm9wZW5haS5jb20vc2VudGluZWwvMjAyNjAyMTlmOWY2L3Nkay5qcyIsbnVsbCwiemgtQ04iLCJ6aC1DTix6aCIsNiwia2V5Ym9hcmTiiJJbb2JqZWN0IEtleWJvYXJkXSIsIl9yZWFjdExpc3RlbmluZ214dmZ1M2x5aDMiLCJtYXRjaE1lZGlhIiwxNjMxMC41LCJmYTlhZWVmYS05MmM5LTQzY2QtYTMwZC1hNGIzNTM1MDkyNGEiLCIiLDgsMTc4NTc3MTA1MzM5OS4yLDAsMCwwLDAsMCwwLDBd~S\",\"id\":\"93090e24-5cd1-4b50-b34f-3800667555a1\",\"flow\":\"email_otp_validate\"}",
+  "method": "POST",
+  "mode": "cors",
+  "credentials": "include"
+});

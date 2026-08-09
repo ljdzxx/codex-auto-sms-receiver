@@ -21,8 +21,19 @@ SMS_ENV_KEYS = (
     "HERO_SMS_MIN_PRICE",
     "HERO_SMS_MAX_PRICE",
     "HERO_SMS_PREFERRED_PRICE",
+    "HERO_SMS_COUNTRY_PRICES",
     "HERO_SMS_ACQUIRE_PRIORITY",
     "HERO_SMS_REUSE_ENABLED",
+    "HERO_SMS_CODE_WAIT",
+    "SMS_CHANNEL_PRIORITY",
+    "SMSBOWER_API_KEY",
+    "SMSBOWER_COUNTRIES",
+    "SMSBOWER_MIN_PRICE",
+    "SMSBOWER_MAX_PRICE",
+    "SMSBOWER_PREFERRED_PRICE",
+    "SMSBOWER_COUNTRY_PRICES",
+    "SMSBOWER_ACQUIRE_PRIORITY",
+    "SMSBOWER_CODE_WAIT",
     "L_API_BASE",
     "L_ADMIN_AUTH_CODE",
     "L_PHONE_PREFIX",
@@ -35,8 +46,18 @@ SMS_ENV_KEYS = (
 
 @pytest.fixture(autouse=True)
 def clean_sms_environment(monkeypatch):
+    # SmsConfigStore.save() writes directly to os.environ. monkeypatch.delenv on
+    # an already-absent key records nothing to undo, so those direct writes would
+    # otherwise leak into later test modules. Snapshot and fully restore instead.
+    saved = {key: os.environ.get(key) for key in SMS_ENV_KEYS}
     for key in SMS_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    yield
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def _payload(**overrides):
@@ -47,6 +68,8 @@ def _payload(**overrides):
         "min_price": "",
         "max_price": "",
         "preferred_price": "",
+        # Per-country prices are now required for every selected country.
+        "country_prices": {"33": {"max": "0.11", "fixed": False}},
         "acquire_priority": "country",
         "max_retries": 8,
         "code_wait": 150,
@@ -71,7 +94,7 @@ def test_save_is_atomic_masks_secret_and_forces_hero(tmp_path: Path):
     assert values["HERO_SMS_API_KEY"] == "hero-secret"
     assert snapshot["provider"] == "hero"
     assert snapshot["credential_configured"] is True
-    assert snapshot["credentials_configured"] == {"hero": True}
+    assert snapshot["credentials_configured"] == {"hero": True, "smsbower": False}
     assert "hero-secret" not in repr(snapshot)
     assert list(tmp_path.glob(".*.tmp")) == []
 
@@ -80,17 +103,17 @@ def test_operator_defaults_are_applied_to_empty_hero_settings(tmp_path: Path):
     store = SmsConfigStore(tmp_path / ".env")
 
     initial = store.snapshot()
-    saved = store.save(_payload(max_price="", max_retries=10, code_wait=30))
+    saved = store.save(_payload(max_price="", code_wait=30))
 
     assert initial["max_price"] == "0.11"
-    assert initial["max_retries"] == 10
     assert initial["code_wait"] == 30
     assert saved["max_price"] == "0.11"
-    assert saved["max_retries"] == 10
     assert saved["code_wait"] == 30
     values = dotenv_values(tmp_path / ".env")
     assert values["HERO_SMS_MAX_PRICE"] == "0.11"
-    assert values["SMS_MAX_RETRIES"] == "10"
+    # max_retries is no longer user-set: it is derived from the channel×country
+    # slot count (1 Hero country here) so the loop exhausts every combination.
+    assert values["SMS_MAX_RETRIES"] == "1"
     assert values["SMS_CODE_WAIT"] == "30"
 
 
@@ -146,6 +169,11 @@ def test_hero_saves_country_and_price_strategy(tmp_path: Path):
     snapshot = store.save(
         _payload(
             countries=["33", "187", "52", "33"],
+            country_prices={
+                "33": {"max": "0.12", "fixed": True},
+                "187": {"max": "0.12", "fixed": False},
+                "52": {"max": "0.10", "fixed": False},
+            },
             service="openai",
             min_price="0.0500",
             max_price="0.12",
@@ -188,13 +216,114 @@ def test_invalid_hero_strategy_is_rejected(tmp_path: Path, overrides: dict):
         {"provider_order": ["hero", "l"]},
         {"countries": ["us"]},
         {"service": "telegram"},
-        {"max_retries": "0"},
+        {"countries": ["33", "187"], "country_prices": {"33": {"max": "0.11"}}},
         {"credential": "secret\nINJECTED=yes"},
     ],
 )
 def test_non_hero_or_invalid_values_are_rejected(tmp_path: Path, overrides: dict):
     with pytest.raises(ValueError):
         SmsConfigStore(tmp_path / ".env").save(_payload(**overrides))
+
+
+def test_smsbower_channel_is_saved_with_priority(tmp_path: Path):
+    store = SmsConfigStore(tmp_path / ".env")
+    snapshot = store.save(
+        _payload(
+            channel_priority=["smsbower", "hero"],
+            smsbower={
+                "credential": "smsbower-secret",
+                "countries": ["7", "187"],
+                "country_prices": {"7": {"max": "0.2"}, "187": {"min": "0.05", "max": "0.2"}},
+                "max_price": "0.2",
+                "acquire_priority": "price",
+            },
+        )
+    )
+
+    values = dotenv_values(tmp_path / ".env")
+    assert snapshot["channel_priority"] == ["smsbower", "hero"]
+    assert snapshot["channels"]["smsbower"]["countries"] == ["7", "187"]
+    assert snapshot["channels"]["smsbower"]["credential_configured"] is True
+    assert snapshot["credentials_configured"] == {"hero": True, "smsbower": True}
+    assert values["SMS_CHANNEL_PRIORITY"] == "smsbower,hero"
+    assert values["SMSBOWER_API_KEY"] == "smsbower-secret"
+    assert values["SMSBOWER_COUNTRIES"] == "7,187"
+    # The upstream module stays Hero-anchored regardless of channel priority.
+    assert values["SMS_PROVIDER"] == "hero"
+    assert "smsbower-secret" not in repr(snapshot)
+
+
+def test_smsbower_credential_reveal_is_explicit(tmp_path: Path):
+    store = SmsConfigStore(tmp_path / ".env")
+    store.save(
+        _payload(
+            channel_priority=["hero", "smsbower"],
+            smsbower={"credential": "sb-key", "countries": ["7"], "country_prices": {"7": {"max": "0.2"}}},
+        )
+    )
+    assert store.reveal_credential("smsbower") == "sb-key"
+    assert store.reveal_credential("hero") == "hero-secret"
+    with pytest.raises(ValueError):
+        store.reveal_credential("grizzly")
+
+
+def test_enabling_smsbower_without_key_or_country_is_rejected(tmp_path: Path):
+    store = SmsConfigStore(tmp_path / ".env")
+    with pytest.raises(ValueError, match="smsbower"):
+        store.save(_payload(channel_priority=["hero", "smsbower"]))
+    with pytest.raises(ValueError, match="smsbower"):
+        store.save(
+            _payload(
+                channel_priority=["hero", "smsbower"],
+                smsbower={"credential": "sb-key"},
+            )
+        )
+
+
+def test_unknown_channel_priority_is_rejected(tmp_path: Path):
+    store = SmsConfigStore(tmp_path / ".env")
+    with pytest.raises(ValueError):
+        store.save(_payload(channel_priority=["hero", "telegram"]))
+
+
+def test_per_channel_code_wait_is_saved_independently(tmp_path: Path):
+    store = SmsConfigStore(tmp_path / ".env")
+    snapshot = store.save(
+        _payload(
+            code_wait=45,
+            channel_priority=["smsbower", "hero"],
+            smsbower={
+                "credential": "sb-key",
+                "countries": ["7"],
+                "country_prices": {"7": {"max": "0.2"}},
+                "code_wait": 200,
+            },
+        )
+    )
+
+    values = dotenv_values(tmp_path / ".env")
+    assert values["HERO_SMS_CODE_WAIT"] == "45"
+    assert values["SMSBOWER_CODE_WAIT"] == "200"
+    # Global SMS_CODE_WAIT tracks the Hero value for upstream default fallback.
+    assert values["SMS_CODE_WAIT"] == "45"
+    assert snapshot["code_wait"] == 45
+    assert snapshot["channels"]["hero"]["code_wait"] == 45
+    assert snapshot["channels"]["smsbower"]["code_wait"] == 200
+
+
+def test_smsbower_code_wait_falls_back_to_global_when_unset(tmp_path: Path):
+    store = SmsConfigStore(tmp_path / ".env")
+    snapshot = store.save(
+        _payload(
+            code_wait=90,
+            channel_priority=["hero", "smsbower"],
+            smsbower={"credential": "sb-key", "countries": ["7"], "country_prices": {"7": {"max": "0.2"}}},
+        )
+    )
+
+    # No smsbower.code_wait supplied -> falls back to the global (Hero) wait.
+    assert snapshot["channels"]["smsbower"]["code_wait"] == 90
+    assert dotenv_values(tmp_path / ".env")["SMSBOWER_CODE_WAIT"] == "90"
 
 
 def test_save_clears_stale_provider_environment(monkeypatch, tmp_path: Path):

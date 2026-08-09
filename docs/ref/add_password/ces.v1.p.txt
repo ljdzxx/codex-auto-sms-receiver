@@ -1,0 +1,25 @@
+fetch("https://chatgpt.com/ces/v1/p", {
+  "headers": {
+    "accept": "*/*",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "authorization": "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6Ik1IVzREcGtLazRRbzNsbkNwLVVQcjB5ZGt1Q0dxMU9BX3Q0UFpxQlJfMFEiLCJ0eXAiOiJKV1QifQ.eyJhdWQiOlsiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS92MSJdLCJjbGllbnRfaWQiOiJhcHBfWDh6WTZ2VzJwUTl0UjNkRTduSzFqTDVnSCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJhbXIiOlsib3RwIiwidXJuOm9wZW5haTphbXI6b3RwX2VtYWlsIl0sImNoYXRncHRfYWNjb3VudF9pZCI6Ijg2NWFkOGIxLTNhNTItNDQ0Mi05ZmQ4LTQ3MWZlOTY5YzE1MiIsImNoYXRncHRfYWNjb3VudF91c2VyX2lkIjoidXNlci1tbTFmdjZjVVRCS3pxeGFSNnBhQmxrMmxfXzg2NWFkOGIxLTNhNTItNDQ0Mi05ZmQ4LTQ3MWZlOTY5YzE1MiIsImNoYXRncHRfY29tcHV0ZV9yZXNpZGVuY3kiOiJub19jb25zdHJhaW50IiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJmcmVlIiwiY2hhdGdwdF91c2VyX2lkIjoidXNlci1tbTFmdjZjVVRCS3pxeGFSNnBhQmxrMmwiLCJpc19zaWdudXAiOnRydWUsInVzZXJfaWQiOiJ1c2VyLW1tMWZ2NmNVVEJLenF4YVI2cGFCbGsybCJ9LCJodHRwczovL2FwaS5vcGVuYWkuY29tL3Byb2ZpbGUiOnsiZW1haWwiOiJjb25zdWx0LnB5bG9uczR6QGljbG91ZC5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwibmFtZSI6IktpbW0gSm9ua2lzIn0sImlzcyI6Imh0dHBzOi8vYXV0aC5vcGVuYWkuY29tIiwicHdkX2F1dGhfdGltZSI6MTc4NTc3MDkxODk4NSwic2NwIjpbIm9wZW5pZCIsImVtYWlsIiwicHJvZmlsZSIsIm9mZmxpbmVfYWNjZXNzIiwibW9kZWwucmVxdWVzdCIsIm1vZGVsLnJlYWQiLCJvcmdhbml6YXRpb24ucmVhZCIsIm9yZ2FuaXphdGlvbi53cml0ZSJdLCJzZXNzaW9uX2lkIjoiYXV0aHNlc3NfdlkwT0V0NVhIVmpYVGtlbzBkM1h3bW9XIiwic2wiOnRydWUsInN1YiI6ImF1dGgwfEtrZEhLVk9Dd1UxWGRLd2tJSzFNYkh5MyIsImlhdCI6MTc4NTc3MDkyMiwiZXhwIjoxNzg2NjM0OTIyLCJqdGkiOiJhNWI0ODNlYzNjNzE0ODAxOGZjZTlhMmI0NGRlZGM5YyIsIm5iZiI6MTc4NTc3MDkyMn0.l9qTSLFMVEokJN4lbjceRGRPCHGH-SnmXc4_mDCTSLICYHMj7t_rDhPxBynFwmmnW5LrqumJ1OCGRDwnAnbWU7buVpRQxTdLfCO2_-TKFF_ZJj5aCNqhb7a09DlZBlHjbDNsnZeUncUBhYYBDhYmkQcRQ3pwct5kJHbAgrVxIiUV56PqWmT_DmJcYUgjfAurQk_UteaKoqbuI7Igjm_hv6ETb4SvRylYH3XmF0w2kiE7Jgrhh98SXdfxsJosDpZJ0JA1EKHlyfe0Y-xH7h3-WEEnkFMIxZXyjcLa51wvPvkMcLbkPdMousw_SxnuEfCsn1o4lWPcxcTfliK3Xp3uTw",
+    "content-type": "text/plain",
+    "oai-client-build-number": "8848688",
+    "oai-client-version": "prod-3410020faf93d4c3977132397e1d459857a86a7c",
+    "oai-device-id": "93090e24-5cd1-4b50-b34f-3800667555a1",
+    "oai-language": "zh-CN",
+    "oai-session-id": "2cc6ec33-c004-4bc3-b317-cf524e7bf5c2",
+    "priority": "u=1, i",
+    "sec-ch-ua": "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin"
+  },
+  "referrer": "https://chatgpt.com/",
+  "body": "{\"timestamp\":\"2026-08-03T15:30:48.956Z\",\"integrations\":{\"Segment.io\":true},\"type\":\"page\",\"properties\":{\"path\":\"/\",\"referrer\":\"https://auth.openai.com/\",\"search\":\"/\",\"title\":\"ChatGPT\",\"url\":\"https://chatgpt.com/#settings/Security\",\"hash\":\"#settings/Security\"},\"context\":{\"page\":{\"path\":\"/\",\"referrer\":\"https://auth.openai.com/\",\"search\":\"/\",\"title\":\"ChatGPT\",\"url\":\"https://chatgpt.com/#settings/Security\",\"hash\":\"#settings/Security\"},\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36\",\"userAgentData\":{\"brands\":[{\"brand\":\"Not;A=Brand\",\"version\":\"8\"},{\"brand\":\"Chromium\",\"version\":\"150\"},{\"brand\":\"Google Chrome\",\"version\":\"150\"}],\"mobile\":false,\"platform\":\"Windows\"},\"locale\":\"zh-CN\",\"library\":{\"name\":\"analytics.js\",\"version\":\"npm:next-1.81.1\"},\"campaign\":{},\"timezone\":\"Asia/Shanghai\",\"app_name\":\"chatgpt\",\"app_version\":\"3410020faf93d4c3977132397e1d459857a86a7c\",\"browser_locale\":\"zh-CN\",\"device_id\":\"93090e24-5cd1-4b50-b34f-3800667555a1\",\"auth_status\":\"logged_in\",\"user_traits\":{\"plan_type\":\"free\",\"workspace_id\":null,\"workspace_type\":null,\"is_openai_internal\":false},\"is_business_ip2\":\"false\"},\"messageId\":\"ajs-next-1785771048956-977b453e-e52b-4e2f-a157-d24544d1d79c\",\"userId\":\"user-mm1fv6cUTBKzqxaR6paBlk2l\",\"anonymousId\":\"9fc47473-b96b-489e-8bdb-2483843ec431\",\"writeKey\":\"oai\",\"sentAt\":\"2026-08-03T15:30:49.016Z\",\"_metadata\":{\"bundled\":[\"Segment.io\"],\"unbundled\":[],\"bundledIds\":[]}}",
+  "method": "POST",
+  "mode": "cors",
+  "credentials": "include"
+});

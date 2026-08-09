@@ -56,6 +56,39 @@ def test_artifact_index_masks_tokens_and_classifies_files(tmp_path: Path):
     assert "path" not in by_name["codex-owner@example.com.json"]
 
 
+def test_credentials_in_date_subdirs_are_discovered_and_exportable(tmp_path: Path):
+    # Credentials are now saved under codex_accounts/{YYYY-MM-DD}/ — the store must
+    # scan recursively so they still list and export.
+    data_dir = tmp_path / "data"
+    day_dir = data_dir / "codex_accounts" / "2026-08-06"
+    log_dir = tmp_path / "logs"
+    day_dir.mkdir(parents=True)
+    log_dir.mkdir()
+    (day_dir / "codex-dated@example.com.json").write_text(
+        json.dumps(
+            {
+                "type": "codex",
+                "email": "dated@example.com",
+                "access_token": "a",
+                "refresh_token": "r",
+                "id_token": "i",
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = ArtifactStore(data_dir, log_dir)
+    creds = store.list_credentials()
+    assert len(creds) == 1
+    assert creds[0]["name"] == "codex-dated@example.com.json"
+    assert creds[0]["exportable"] is True
+    # id resolves back to the file under the date subdir
+    resolved = store.credential_file(creds[0]["id"])
+    assert resolved is not None and resolved.parent.name == "2026-08-06"
+    # and it shows up in the export set
+    exportable = store.exportable_credential_files()
+    assert [rel for _, rel in exportable] == ["2026-08-06/codex-dated@example.com.json"]
+
+
 def test_artifact_ids_resolve_only_known_files(tmp_path: Path):
     data_dir = tmp_path / "data"
     credential_dir = data_dir / "codex_accounts"

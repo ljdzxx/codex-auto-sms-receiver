@@ -56,6 +56,7 @@ def worker_main(settings, task_queue, result_queue) -> None:
         job_id = str(task.get("job_id") or "")
         attempt = int(task.get("attempt") or 1)
         mailbox = task.get("mailbox") if isinstance(task.get("mailbox"), dict) else {}
+        cancel_event = task.get("cancel_event")
         log_path = Path(str(task.get("log_path") or ""))
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -75,7 +76,7 @@ def worker_main(settings, task_queue, result_queue) -> None:
                     "dispatch_id": dispatch_id,
                     "job_id": job_id,
                     "attempt": attempt,
-                    "result": _safe_result(run_codex_only(settings, mailbox)),
+                    "result": _safe_result(run_codex_only(settings, mailbox, cancel_event=cancel_event)),
                 }
             )
         except Exception as exc:

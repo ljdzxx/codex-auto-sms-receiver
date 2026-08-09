@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Codex Auto SMS Receiver</title>
+  <link rel="stylesheet" href="./sidepanel.css">
+</head>
+<body>
+<header>
+  <div class="brand"><h1>Codex Auto SMS Receiver</h1><div class="sub">基于 HeroSMS 的 Codex 自动接码与 OAuth 登录工具</div></div>
+  <div class="header-runtime" aria-live="polite">
+    <span id="readinessStatus" class="runtime-chip"><span class="runtime-dot"></span>正在检查运行状态</span>
+    <span id="syncStatus" class="sync-state">自动同步中</span>
+  </div>
+</header>
+<main>
+  <nav class="workspace-tabs" aria-label="工作区">
+    <button type="button" class="workspace-tab active" data-view="accounts" aria-current="page">账号与任务</button>
+    <button type="button" class="workspace-tab" data-view="sms">接码配置</button>
+    <button type="button" class="workspace-tab" data-view="results">凭证与统计</button>
+    <button type="button" class="workspace-tab" data-view="logs">运行日志</button>
+    <button type="button" class="workspace-tab" data-view="debug">调试</button>
+  </nav>
+
+  <div class="grid" id="topGrid">
+    <details class="card import-card" id="importPanel" data-workspace="accounts" open>
+      <summary><span class="import-summary-mark">＋</span><span class="import-summary-copy"><strong>导入已有账号</strong><small>粘贴登录素材；导入后自动加入待处理队列。</small></span><b>打开导入</b></summary>
+      <div class="body import-body">
+        <div class="import-layout">
+          <aside class="import-guide">
+            <span class="import-guide-label">只需两步</span>
+            <strong>选择登录方式，然后粘贴账号素材</strong>
+            <p>一行一个账号。密码和 2FA 密钥等敏感素材仅保存在本机。</p>
+            <div class="import-format-card"><span>当前格式</span><code id="importFormatExample">email----邮箱密码----clientId----refreshToken</code></div>
+            <div class="import-local-note">不会创建或注册新账号</div>
+          </aside>
+          <div class="import-form">
+            <label for="source">登录素材类型</label>
+            <select id="source"><option value="outlook">Outlook / Microsoft Graph</option><option value="generic_api">iCloud 取码 API Key</option><option value="code_url">验证码 URL（HTML / JSON / 文本）</option><option value="password_totp">账号密码 + TOTP 2FA</option></select>
+            <div id="importSourceHint" class="import-source-hint">适用于 Outlook / Hotmail，使用 Microsoft Graph 读取验证码。</div>
+            <label for="materials">账号素材</label>
+            <textarea id="materials" spellcheck="false" placeholder="一行一个已有账号&#10;name@example.com----邮箱密码----clientId----refreshToken"></textarea>
+            <div class="import-input-meta"><span id="importLineCount">尚未粘贴账号</span><span>空行会自动忽略</span></div>
+            <div id="importFeedback" class="import-feedback" aria-live="polite" hidden></div>
+            <div class="actions import-actions"><button type="button" class="primary" id="importAccounts" disabled>导入账号</button></div>
+          </div>
+        </div>
+      </div>
+    </details>
+    <section class="card" data-workspace="sms" hidden>
+      <div class="head"><h2>Hero SMS 接码</h2><p>设置国家候补队列；前一个国家无号时，会自动尝试下一个。</p></div>
+      <div class="body">
+        <div class="hero-flow hero-simple-flow">
+          <div class="hero-flow-top">
+            <div class="hero-provider"><span class="hero-service-icon">HS</span><div><strong>Hero SMS</strong><span>OpenAI 短信验证 · 服务代码 dr</span></div></div>
+            <span id="availability" class="hero-runtime-state">正在检查运行状态……</span>
+          </div>
+
+          <div class="hero-step">
+            <div class="hero-step-title"><span class="hero-step-number">1</span>连接 Hero SMS <small>API Key 只保存在本机</small></div>
+            <div id="smsCredentialState" class="credential-state"></div>
+            <label for="smsCredential" id="smsCredentialLabel" class="hero-field-label">API Key</label>
+            <div class="secret-input"><input id="smsCredential" type="password" autocomplete="new-password" placeholder="请输入 Hero SMS API Key"><button id="toggleSmsCredential" type="button" aria-pressed="false">显示</button></div>
+            <div id="smsCredentialHint" class="hero-inline-hint"></div>
+            <div class="hero-channel-wait"><label for="smsCodeWait">单号等待秒数</label><input id="smsCodeWait" type="number" min="30" max="600" value="30"><small>该渠道号码等待验证码的超时时间</small></div>
+          </div>
+
+          <div class="hero-step hero-country-step">
+            <div class="hero-step-title"><span class="hero-step-number">2</span>设置国家优先队列 <small>最多 10 个</small></div>
+            <div class="hero-fallback-tip"><strong>自动回退</strong><span>严格从上到下拿号：第 1 个国家无号 → 第 2 个 → 第 3 个……</span></div>
+            <div class="hero-country-picker">
+              <div><label for="heroCountrySearch" class="hero-field-label">搜索国家</label><div class="hero-country-search"><input id="heroCountrySearch" type="text" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="heroCountryOptions" autocomplete="off" placeholder="输入中文或英文国名" disabled><div id="heroCountryOptions" class="hero-country-options" role="listbox" hidden></div></div></div>
+              <button type="button" id="addHeroCountry" disabled>加入队列</button>
+            </div>
+            <div id="heroCatalogState" class="hero-catalog-state">正在加载中文国家目录……</div>
+            <div id="heroCountryResult" class="hero-country-result">
+              <div class="hero-selected-summary"><span>拿号优先级（可上下调整）</span><strong><span id="heroCountryCount">0</span> / 10</strong></div>
+              <div id="heroSelectedCountries" class="hero-selected-list"><div class="hero-empty-selection">请先选择国家并加入队列</div></div>
+              <div id="heroQueuePreview" class="hero-queue-preview" aria-live="polite">尚未设置拿号顺序</div>
+            </div>
+          </div>
+
+          <details class="hero-advanced" open>
+            <summary><span>高级设置（可选）</span><small>等待时间、余额与库存</small></summary>
+            <div class="hero-advanced-body">
+              <p class="hero-field-hint">单号限价改到上方每个国家单独设置（价格上限 maxPrice + 是否精准匹配 fixedPrice）。失败后按队列顺序把所有国家逐个试完，不再有“最多换号次数”。</p>
+              <div class="hero-query-actions"><button type="button" id="queryHeroBalance">查询余额</button><button type="button" class="primary-query" id="queryHeroOffers">查询队列国家的价格与库存</button></div>
+              <div id="heroQueryResult" class="hero-query-result" aria-live="polite">保存 API Key 后，可以查询余额和库存。</div>
+              <label class="check hero-clear-key"><input id="smsClearCredential" type="checkbox"> 清除已保存的 API Key</label>
+            </div>
+          </details>
+
+          <details class="hero-advanced hero-smsbower" id="smsbowerSection">
+            <summary><span>接码渠道：smsbower（与 Hero 平级）</span><small>可与 Hero SMS 各自设置优先级</small></summary>
+            <div class="hero-advanced-body">
+              <label class="check"><input id="smsbowerEnabled" type="checkbox"> 启用 smsbower 渠道</label>
+              <div id="smsbowerFields" class="smsbower-fields" hidden>
+                <div>
+                  <label for="smsbowerCredential" class="hero-field-label">smsbower API Key</label>
+                  <div id="smsbowerCredentialState" class="credential-state"></div>
+                  <div class="secret-input"><input id="smsbowerCredential" type="password" autocomplete="new-password" placeholder="请输入 smsbower API Key"><button id="toggleSmsbowerCredential" type="button" aria-pressed="false">显示</button></div>
+                  <label class="check hero-clear-key"><input id="smsbowerClearCredential" type="checkbox"> 清除已保存的 smsbower API Key</label>
+                  <div class="hero-channel-wait"><label for="smsbowerCodeWait">单号等待秒数</label><input id="smsbowerCodeWait" type="number" min="30" max="600" value="30"><small>该渠道号码等待验证码的超时时间</small></div>
+                </div>
+                <div class="hero-country-step">
+                  <div class="hero-step-title">设置 smsbower 国家优先队列 <small>最多 10 个，与 Hero 共用国家目录</small></div>
+                  <div class="hero-country-picker">
+                    <div><label for="smsbowerCountrySearch" class="hero-field-label">搜索国家</label><div class="hero-country-search"><input id="smsbowerCountrySearch" type="text" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="smsbowerCountryOptions" autocomplete="off" placeholder="输入中文或英文国名" disabled><div id="smsbowerCountryOptions" class="hero-country-options" role="listbox" hidden></div></div></div>
+                    <button type="button" id="addSmsbowerCountry" disabled>加入队列</button>
+                  </div>
+                  <div class="hero-country-result">
+                    <div class="hero-selected-summary"><span>拿号优先级（可上下调整）</span><strong><span id="smsbowerCountryCount">0</span> / 10</strong></div>
+                    <div id="smsbowerSelectedCountries" class="hero-selected-list"><div class="hero-empty-selection">请先选择国家并加入队列</div></div>
+                    <div id="smsbowerQueuePreview" class="hero-queue-preview" aria-live="polite">尚未设置拿号顺序</div>
+                  </div>
+                </div>
+                <div class="hero-price-grid">
+                  <div><label for="channelPriority">渠道优先级</label><select id="channelPriority"><option value="hero_first">先 Hero SMS，后 smsbower</option><option value="smsbower_first">先 smsbower，后 Hero SMS</option></select></div>
+                </div>
+                <p class="hero-field-hint">smsbower 单号限价（最低价/价格上限）也改到上方每个国家单独设置。</p>
+                <div class="hero-query-actions"><button type="button" id="querySmsbowerBalance">余额查询</button></div>
+                <div id="smsbowerQueryResult" class="hero-query-result" aria-live="polite">保存 smsbower API Key 后，可以查询余额。</div>
+              </div>
+            </div>
+          </details>
+
+          <div class="hero-save-area">
+            <div class="hero-action-note"><span class="hero-action-dot"></span><span>保存后，下一个 OAuth 任务会按上方国家顺序自动接码。</span></div>
+            <button class="primary hero-save" id="saveSmsConfig" disabled>保存并使用此优先队列</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <section class="card pipeline-card" id="pipelineCard" data-workspace="accounts">
+    <div class="pipeline-head">
+      <div><h2>批量处理账号</h2><p>一次启动整批账号，系统会自动排队、登录、接码并保存凭证。</p></div>
+      <span id="pipelineStateBadge" class="pipeline-state idle"><span class="dot"></span>尚未启动</span>
+    </div>
+    <div class="pipeline-launch">
+      <div class="pipeline-launch-copy"><span>本批次</span><strong id="pipelineReadyTitle">正在计算可处理账号</strong><small id="pipelineSelectionHint">已有凭证、正在运行或登录素材未就绪的账号会自动跳过。</small></div>
+      <div class="pipeline-primary-actions"><button type="button" class="primary" id="startPipeline" disabled>暂无可处理账号</button><button type="button" id="exportSessionPipeline" disabled>导出 Session</button><button type="button" id="loginOnlyPipeline" disabled>仅登录</button><button type="button" id="gcashPipeline" disabled>gcash提炼</button><button type="button" id="pausePipeline" hidden>暂停流水线</button><button type="button" id="resumePipeline" class="primary" hidden>继续流水线</button><button type="button" id="stopPipeline" class="quiet-danger" hidden>停止后续任务</button></div>
+    </div>
+    <details class="pipeline-settings" id="pipelineSettings" open>
+      <summary><span>运行设置</span><small id="pipelineSettingsSummary">待处理账号 · 同时 1 个 · 失败重试 1 次</small></summary>
+      <div class="pipeline-controls">
+        <label><span>处理哪些账号</span><select id="pipelineScope"><option value="pending">全部待处理账号</option><option value="failed">只处理上次失败账号</option><option value="runnable">全部可运行账号</option><option value="selected">只处理表格中选中的账号</option></select></label>
+        <label><span>同时处理数量</span><input id="pipelineConcurrency" type="number" min="1" max="3" value="1" inputmode="numeric"><small>建议 1–2，减少限流</small></label>
+        <label><span>失败后自动重试</span><input id="pipelineRetryLimit" type="number" min="0" max="99" value="0" inputmode="numeric"><small>不包含任务内部换号</small></label>
+      </div>
+    </details>
+    <div class="pipeline-progress" id="pipelineProgress" aria-live="polite" hidden>
+      <div class="pipeline-progress-copy"><strong id="pipelineProgressTitle">等待启动</strong><span id="pipelineProgressMeta">已选 0 个账号</span></div>
+      <div class="progress-track" aria-hidden="true"><span id="pipelineProgressBar" style="width:0%"></span></div>
+      <div id="pipelineCounts" class="pipeline-counts"><span>待处理 0</span><span>运行中 0</span><span>成功 0</span><span>失败 0</span></div>
+    </div>
+  </section>
+  <section class="card" data-workspace="accounts">
+    <div class="head accounts-head"><div><h2>账号清单</h2><p id="accountsSummary">导入后的账号会显示在这里；可运行账号默认加入本批次。</p></div><div class="account-tools"><button type="button" class="primary account-import-shortcut" id="openImportFromAccounts">＋ 导入账号</button><button type="button" id="exportGcashResults">导出 gcash 提炼结果</button><select id="accountFilter" aria-label="筛选账号"><option value="all">全部状态</option><option value="pending">待处理</option><option value="active">运行中</option><option value="success">已成功</option><option value="failed">失败</option></select><input id="accountSearch" class="toolbar-search" type="text" placeholder="搜索邮箱或状态" autocomplete="off"></div></div>
+    <div id="accountBulkBar" class="account-bulk-bar" hidden><strong id="accountSelectedCount">已选 0 个</strong><span>可用于流水线，也可按原导入格式备份或批量删除。</span><button type="button" id="exportSelectedAccounts">导出原格式</button><button type="button" class="quiet-danger" id="deleteSelectedAccounts">删除所选</button><button type="button" id="clearAccountSelection">取消选择</button></div>
+    <div id="accounts"><div class="empty">尚未导入账号</div></div>
+  </section>
+  <section class="archive-grid" data-workspace="results" hidden>
+    <article class="card archive-wide">
+      <div class="head head-toolbar"><div><h2>成功凭证</h2><p>勾选多个账号即可批量导出；手机号按本机原始记录显示，Token 不在页面中展开。</p></div><div class="credential-head-actions"><button type="button" id="downloadAllCredentials" disabled>打包全部凭证</button></div></div>
+      <div class="credential-bulk-bar"><strong id="credentialSelectedCount">已选 0 个</strong><span>每次最多选择 100 个；导出文件包含完整 OAuth Token。</span><select id="credentialExportFormat" aria-label="凭证导出格式"><option value="codex_json">Codex 原始 JSON（ZIP）</option><option value="sub2api">Sub2API 导入 JSON</option></select><button type="button" id="selectAllCredentials" disabled>全选</button><button type="button" id="clearCredentialSelection" disabled>取消选择</button><button type="button" class="quiet-danger" id="deleteSelectedCredentials" disabled>删除所选</button><button type="button" class="primary" id="downloadSelectedCredentials" disabled>导出所选</button></div>
+      <div id="credentials"><div class="empty">暂无可导出的 OAuth 凭证</div></div>
+    </article>
+    <article class="card sms-stats-card" id="smsStatsCard">
+      <div class="head head-toolbar">
+        <div><h2>接码统计</h2><p>查看各国拿号、收码和验证效果，以及每次使用的完整号码。</p></div>
+        <div class="sms-stats-head-actions"><span id="smsStatsUpdated" class="sms-stats-updated">正在自动加载</span></div>
+      </div>
+      <div class="sms-stats-content" id="smsStatsContent" aria-busy="false">
+        <div id="smsStatsOverview" class="sms-stats-overview" role="status" aria-live="polite">
+          <div class="sms-stat-metric"><span class="sms-stat-metric-label">已拿号码</span><strong>—</strong><small>等待加载</small></div>
+          <div class="sms-stat-metric"><span class="sms-stat-metric-label">收到验证码</span><strong>—</strong><small>等待加载</small></div>
+          <div class="sms-stat-metric"><span class="sms-stat-metric-label">验证成功</span><strong>—</strong><small>等待加载</small></div>
+          <div class="sms-stat-metric"><span class="sms-stat-metric-label">总体成功率</span><strong>—</strong><small>等待加载</small></div>
+          <div class="sms-stat-metric"><span class="sms-stat-metric-label">平均报价</span><strong>—</strong><small>等待加载</small></div>
+        </div>
+        <div id="smsStatsNotes" class="sms-stats-notes" aria-live="polite"></div>
+        <section class="sms-stats-section" aria-labelledby="smsCountryStatsTitle">
+          <div class="sms-stats-section-head"><div><h3 id="smsCountryStatsTitle">按国家统计</h3><p>对比国家成功率、收码情况和平均报价。</p></div><span id="smsCountryCount">0 个国家</span></div>
+          <div id="smsCountryStats"><div class="sms-stats-empty">暂无接码记录</div></div>
+        </section>
+        <section class="sms-stats-section sms-stats-records" aria-labelledby="smsNumberRecordsTitle">
+          <div class="sms-stats-section-head"><div><h3 id="smsNumberRecordsTitle">号码明细</h3><p>按最近拿号时间展示完整号码、价格和结果。</p></div><span id="smsRecordCount">0 条记录</span></div>
+          <div id="smsNumberRecords"><div class="sms-stats-empty">暂无号码明细</div></div>
+        </section>
+      </div>
+    </article>
+  </section>
+  <article class="card timeline-card" data-workspace="logs" hidden>
+    <div class="head head-toolbar">
+      <div><h2>任务时间线</h2><p>所有任务合并展示，先看结论和原因；展开一行可查看已经脱敏的技术详情。</p></div>
+      <div class="timeline-head-status"><span><i id="timelineLiveDot" class="timeline-live-dot paused"></i> <b id="timelineAutoStatus">进入日志页后自动更新</b></span><span id="timelineUpdated">尚未加载</span></div>
+    </div>
+    <section class="timeline-recent" aria-label="最近任务结论" aria-live="polite">
+      <div class="timeline-recent-item"><span>最近状态</span><strong id="timelineRecentStatus" class="status idle"><span class="dot"></span>等待日志</strong></div>
+      <div class="timeline-recent-item"><span>账号</span><strong id="timelineRecentAccount">—</strong></div>
+      <div class="timeline-recent-item"><span>阶段</span><strong id="timelineRecentStage">—</strong></div>
+      <div class="timeline-recent-item"><span>结论 / 原因</span><p id="timelineRecentReason" title="">等待加载最近任务</p></div>
+      <div class="timeline-recent-item"><span>更新时间</span><strong id="timelineRecentTime">—</strong></div>
+    </section>
+    <div class="timeline-toolbar">
+      <div class="timeline-filter-group" role="group" aria-label="按级别筛选时间线">
+        <button type="button" class="timeline-filter active" data-timeline-level="important" aria-pressed="true">关键 <span id="timelineCountImportant">0</span></button>
+        <button type="button" class="timeline-filter" data-timeline-level="all" aria-pressed="false">全部 <span id="timelineCountAll">0</span></button>
+        <button type="button" class="timeline-filter" data-timeline-level="problem" aria-pressed="false">失败/错误 <span id="timelineCountError">0</span></button>
+        <button type="button" class="timeline-filter" data-timeline-level="warn" aria-pressed="false">警告 <span id="timelineCountWarn">0</span></button>
+      </div>
+      <div class="timeline-search"><label class="sr-only" for="timelineSearch">搜索合并时间线</label><input id="timelineSearch" type="text" placeholder="搜索账号、阶段、结论、详情或来源文件" autocomplete="off"><button type="button" id="clearTimelineSearch">清空</button><small>搜索范围：当前合并时间线中的账号、阶段、脱敏摘要/详情、日志来源与文件名。</small></div>
+      <button type="button" id="refreshTimeline">立即更新</button>
+    </div>
+    <div class="timeline-statusbar" role="status" aria-live="polite">
+      <span id="timelineStats">正在准备任务时间线……</span>
+      <div><span>敏感信息已隐藏</span><span id="timelineSourceStats">—</span></div>
+    </div>
+    <div id="timelineRecords" class="timeline-records"><div class="log-empty">打开日志工作区后，这里会自动显示全部任务。</div></div>
+    <div class="log-pagination timeline-pagination"><span id="timelinePageStatus">—</span><div><button type="button" id="previousTimelinePage" disabled>上一页</button><button type="button" id="nextTimelinePage" disabled>下一页</button></div></div>
+    <details id="rawLogExplorer" class="raw-log-explorer">
+      <summary><strong>高级 / 原始日志</strong><span>按物理文件查看、复制或下载；通常无需使用</span></summary>
+      <div class="raw-log-body">
+        <div class="raw-log-warning"><span>下方查看器只读取你主动选择的单个文件，并且不会自动刷新。</span><button type="button" id="downloadAllLogs" disabled>下载全部原始日志</button></div>
+        <div class="simple-log-toolbar">
+          <label class="simple-log-field simple-log-file-field"><span>原始日志文件</span><select id="logFileSelect" aria-label="选择原始日志文件"><option value="">请选择文件</option></select></label>
+          <label class="simple-log-field simple-log-search-field"><span>在当前文件中查找</span><input id="logSearch" type="text" placeholder="搜索当前文件的时间、来源或脱敏内容" autocomplete="off" aria-label="搜索当前原始日志文件"></label>
+          <label class="simple-log-field"><span>显示内容</span><select id="logLevel" aria-label="原始日志级别筛选"><option value="all">全部记录</option><option value="problem">只看错误</option><option value="warn">只看警告</option><option value="info">只看普通信息（不含警告和错误）</option></select></label>
+          <button type="button" id="clearLogSearch">清空</button>
+          <p class="raw-search-hint">搜索和级别筛选仅作用于当前选择的文件，不影响上方合并任务时间线；“错误”包含 ERROR 与 FATAL，“普通信息”不含警告和错误。</p>
+        </div>
+        <div class="simple-log-actionbar">
+          <div class="simple-log-info"><strong id="selectedLogName">请选择一个原始日志文件</strong><span id="selectedLogMeta">选择后才会读取文件内容</span></div>
+          <div class="simple-log-actions"><button type="button" id="refreshSelectedLog" disabled>手动刷新</button><button type="button" id="copyVisibleLogs" disabled>复制本页</button><button type="button" id="downloadSelectedLog" disabled>下载当前文件</button></div>
+        </div>
+        <div id="logStats" class="simple-log-summary" role="status" aria-live="polite">尚未选择原始日志文件</div>
+        <div id="logRecords" class="log-records simple-log-records"><div class="log-empty">请选择一个文件；高级查看器不会自动读取或刷新。</div></div>
+        <div class="log-pagination simple-log-pagination"><span id="logPageStatus">—</span><div><button type="button" id="previousLogPage" disabled>上一页</button><button type="button" id="nextLogPage" disabled>下一页</button></div></div>
+      </div>
+    </details>
+  </article>
+  <article class="card debug-card" data-workspace="debug" hidden>
+    <div class="head">
+      <div><h2>调试</h2><p>调试工具分两类：「标签页绑定」按你选中的标签页 id 精确操作（不抢焦点、不受活动页影响）；下方「添加密码」仍走当前活动标签页。</p></div>
+    </div>
+    <section class="debug-section">
+      <div class="debug-section-head">
+        <h3>标签页绑定</h3>
+        <div class="debug-section-tools">
+          <label class="debug-toggle"><input type="checkbox" id="debugTabInjectableOnly" checked> 只看可注入</label>
+          <button type="button" id="debugRefreshTabs" class="secondary-query">刷新</button>
+        </div>
+      </div>
+      <p class="debug-hint">列表随标签页增删自动刷新。无痕窗口的标签页需要先在 <code>chrome://extensions</code> 为本扩展开启「允许在无痕模式下运行」才会出现；<code>chrome://</code>、应用商店等页面无法注入，已标灰。</p>
+      <div id="debugTabList" class="debug-tab-list"><div class="debug-tab-empty">正在读取标签页…</div></div>
+      <div class="debug-actions">
+        <button type="button" id="debugSnapshot" class="primary-query" disabled>快照</button>
+      </div>
+      <div id="debugSnapshotResult" class="debug-result" aria-live="polite">选中一个标签页后点「快照」：记录该页的 URL / 标题 / DOM / 可操作元素清单（含选择器），落盘到后端 <code>logs/debug/</code>。</div>
+    </section>
+    <section class="debug-section">
+      <div class="debug-section-head">
+        <h3>gcash 提炼</h3>
+        <span class="debug-section-note" id="gcashTabsSaved">尚未绑定</span>
+      </div>
+      <p class="debug-hint">从上面的标签页列表里各选一个：「ChatGPT登录」用于登录账号、打开付款链接并等待扫码；「153提炼」停在 <code>pay.153.ink</code> 提炼页（代理池、通道等参数请先在该页手动配好，流程只会填 Access Token 并点「开始提炼」）。<b>建议把两个标签页放在两个各自可见的窗口</b>——同窗口时后台那个会被 Chrome 降频，提炼页自身的轮询会变得很慢。</p>
+      <label class="debug-field"><span>ChatGPT登录</span><select id="gcashLoginTab"></select></label>
+      <label class="debug-field"><span>153提炼</span><select id="gcashExtractTab"></select></label>
+      <div class="debug-actions">
+        <button type="button" id="gcashSaveTabs" class="primary-query">保存</button>
+      </div>
+      <div id="gcashTabsResult" class="debug-result" aria-live="polite">选好两个标签页后点「保存」，「账号与任务」页的 gcash提炼 才能启动。</div>
+    </section>
+    <section class="debug-section">
+      <div class="debug-section-head"><h3>添加密码</h3></div>
+      <p class="debug-hint">直接在“当前活动标签页”里，用页面自身的会话 / cookie / sentinel 复现接口调用。请先在浏览器里打开并登录 chatgpt.com，再点下面的按钮。</p>
+      <div class="debug-actions">
+        <button type="button" id="debugAddPassword" class="primary-query">添加密码</button>
+      </div>
+      <div id="debugResult" class="debug-result" aria-live="polite">点击“添加密码”，为当前已登录账户走一遍“设置密码”流程（不消耗短信）。</div>
+    </section>
+  </article>
+</main>
+<div id="toast"></div>
+
+<script src="./sidepanel.js"></script>
+</body>
+</html>

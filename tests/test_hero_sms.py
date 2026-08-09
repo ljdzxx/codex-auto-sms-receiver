@@ -386,6 +386,102 @@ def test_runtime_strategy_rotates_to_next_country_after_acquired_number(monkeypa
     patch.restore()
 
 
+def test_smsbower_rotates_to_next_country_after_acquired_number(monkeypatch):
+    activations = []
+
+    def handler(params):
+        action = params["action"]
+        country = str(params.get("country") or "")
+        if action == "getNumber":
+            activations.append(country)
+            return FakeResponse(text=f"ACCESS_NUMBER:sb-{len(activations)}:15551234567")
+        return FakeResponse(text="STATUS_WAIT_CODE")
+
+    http = RoutingHttp(handler)
+    module = _coordinator_module(http)
+    monkeypatch.setenv("HERO_SMS_API_KEY", "hero-key")
+    monkeypatch.setenv("HERO_SMS_COUNTRIES", "33")
+    monkeypatch.setenv("SMSBOWER_API_KEY", "sb-key")
+    monkeypatch.setenv("SMSBOWER_COUNTRIES", "187,52,73")
+    monkeypatch.setenv("SMS_CHANNEL_PRIORITY", "smsbower")
+    monkeypatch.delenv("SMSBOWER_MIN_PRICE", raising=False)
+    monkeypatch.delenv("SMSBOWER_MAX_PRICE", raising=False)
+
+    patch = install_hero_sms_patch(module)
+    # Each successful acquisition advances smsbower's own cursor to the next
+    # configured country (symmetric to Hero), so retries rotate rather than
+    # hammering the first country.
+    assert module.acquire_number(http=http)[0] == "sb-1"
+    assert module.acquire_number(http=http)[0] == "sb-2"
+    assert module.acquire_number(http=http)[0] == "sb-3"
+    assert activations == ["187", "52", "73"]
+    patch.restore()
+
+
+def test_hero_uses_per_country_price_and_fixed(monkeypatch):
+    requests_seen = []
+
+    def handler(params):
+        action = params["action"]
+        if action in {"getPricesExtended", "getPrices"}:
+            return FakeResponse(payload={str(params.get("country")): {"dr": {"0.30": {"count": 5}}}})
+        if action in {"getNumber", "getNumberV2"}:
+            requests_seen.append(dict(params))
+            return FakeResponse(text="ACCESS_NUMBER:pc-1:15551234567")
+        return FakeResponse(text="STATUS_WAIT_CODE")
+
+    http = RoutingHttp(handler)
+    module = _coordinator_module(http)
+    monkeypatch.setenv("HERO_SMS_API_KEY", "hero-key")
+    monkeypatch.setenv("HERO_SMS_COUNTRIES", "33,187")
+    # Per-country prices override any catalog tier: country 33 -> 0.05 fixed.
+    monkeypatch.setenv(
+        "HERO_SMS_COUNTRY_PRICES",
+        '{"33": {"max": "0.05", "fixed": true}, "187": {"max": "0.20", "fixed": false}}',
+    )
+    monkeypatch.delenv("HERO_SMS_MAX_PRICE", raising=False)
+
+    patch = install_hero_sms_patch(module)
+    assert module.acquire_number(http=http)[0] == "pc-1"
+    buy = next(p for p in requests_seen if p["action"] in {"getNumber", "getNumberV2"})
+    assert buy["country"] == "33"
+    assert buy["maxPrice"] == "0.05"
+    assert buy["fixedPrice"] == "true"
+    patch.restore()
+
+
+def test_smsbower_uses_per_country_min_max(monkeypatch):
+    requests_seen = []
+
+    def handler(params):
+        if params["action"] == "getNumber":
+            requests_seen.append(dict(params))
+            return FakeResponse(text="ACCESS_NUMBER:sb-pc:15551234567")
+        return FakeResponse(text="STATUS_WAIT_CODE")
+
+    http = RoutingHttp(handler)
+    module = _coordinator_module(http)
+    monkeypatch.setenv("HERO_SMS_API_KEY", "hero-key")
+    monkeypatch.setenv("HERO_SMS_COUNTRIES", "33")
+    monkeypatch.setenv("SMSBOWER_API_KEY", "sb-key")
+    monkeypatch.setenv("SMSBOWER_COUNTRIES", "187")
+    monkeypatch.setenv("SMS_CHANNEL_PRIORITY", "smsbower")
+    monkeypatch.setenv(
+        "SMSBOWER_COUNTRY_PRICES",
+        '{"187": {"min": "0.08", "max": "0.25"}}',
+    )
+    monkeypatch.delenv("SMSBOWER_MIN_PRICE", raising=False)
+    monkeypatch.delenv("SMSBOWER_MAX_PRICE", raising=False)
+
+    patch = install_hero_sms_patch(module)
+    assert module.acquire_number(http=http)[0] == "sb-pc"
+    buy = requests_seen[0]
+    assert buy["country"] == "187"
+    assert buy["minPrice"] == "0.08"
+    assert buy["maxPrice"] == "0.25"
+    patch.restore()
+
+
 def test_runtime_strategy_keeps_hard_cap_when_price_lookup_fails(monkeypatch):
     def handler(params):
         if params["action"] in {"getPricesExtended", "getPrices"}:

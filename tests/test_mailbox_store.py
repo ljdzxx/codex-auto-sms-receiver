@@ -130,6 +130,25 @@ def test_import_password_totp_allows_pipe_characters_in_password(workspace_path:
     assert secret["totp_secret"] == "JBSWY3DPEHPK3PXP"
 
 
+def test_import_password_totp_accepts_dashes_and_extra_fields(workspace_path: Path):
+    store = MailboxStore(workspace_path)
+    result = store.import_text(
+        "password_totp",
+        "owner@example.com----chatgpt-pass----JBSWY3DPEHPK3PXP----备注----2026-08-07\n"
+        "second@example.com----other-pass----JBSWY3DPEHPK3PXP\n"
+        "third@example.com|pipe-pass|JBSWY3DPEHPK3PXP|备注",
+    )
+
+    assert result == {"parsed": 3, "inserted": 3, "updated": 0, "invalid": 0}
+    first = store.get_secret(email="owner@example.com")
+    assert first["password"] == "chatgpt-pass"
+    assert first["totp_secret"] == "JBSWY3DPEHPK3PXP"
+    assert store.get_secret(email="second@example.com")["password"] == "other-pass"
+    third = store.get_secret(email="third@example.com")
+    assert third["password"] == "pipe-pass"
+    assert third["totp_secret"] == "JBSWY3DPEHPK3PXP"
+
+
 def test_export_original_preserves_each_import_format_and_delete_many(workspace_path: Path):
     store = MailboxStore(workspace_path)
     outlook = "mail@example.com====mail-pass====client-id====refresh-token"
@@ -156,6 +175,8 @@ def test_export_original_preserves_each_import_format_and_delete_many(workspace_
         "owner@icloud.example||JBSWY3DPEHPK3PXP",
         "owner@icloud.example|fictional-password|",
         "owner@icloud.example|fictional-password",
+        "owner@icloud.example----fictional-password",
+        "owner@icloud.example----fictional-password----not-base32----备注",
     ],
 )
 def test_import_password_totp_rejects_missing_fields(workspace_path: Path, material: str):
@@ -195,3 +216,15 @@ def test_public_account_exposes_credential_presence_not_path(workspace_path: Pat
     assert public["phone_number"] == "+84123456789"
     assert public["codex_status"] == "failed"
     assert "credential_path" not in public
+
+
+def test_signup_password_is_stored_and_exposed(workspace_path: Path):
+    store = MailboxStore(workspace_path)
+    store.import_text("generic_api", "owner@example.com----https://mail.test/code")
+
+    assert store.update_signup_password("owner@example.com", "Aa1!examplePass") is True
+
+    public = store.list_accounts()[0]
+    assert public["signup_password"] == "Aa1!examplePass"
+    secret = store.get_secret(email="owner@example.com")
+    assert secret["signup_password"] == "Aa1!examplePass"

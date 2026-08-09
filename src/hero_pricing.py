@@ -234,18 +234,25 @@ class HeroPricingClient:
         *,
         http_get: Callable[..., Any] | None = None,
         timeout_seconds: int = 20,
+        api_base: str = HERO_SMS_API_BASE,
+        provider_label: str = "Hero SMS",
     ) -> None:
         self._api_key = str(api_key or "").strip()
         self._http_get = http_get or requests.get
         self._timeout_seconds = max(3, min(60, int(timeout_seconds)))
+        # smsbower speaks the same SMS-Activate handler protocol as Hero, so the
+        # only per-provider differences are the endpoint host and the label used
+        # in user-facing error text.
+        self._api_base = str(api_base or HERO_SMS_API_BASE).strip() or HERO_SMS_API_BASE
+        self._provider_label = str(provider_label or "Hero SMS").strip() or "Hero SMS"
 
     def _request(self, action: str, **params: Any) -> Any:
         if not self._api_key:
-            raise HeroPricingError("Hero SMS API Key 尚未配置")
+            raise HeroPricingError(f"{self._provider_label} API Key 尚未配置")
         query = {"api_key": self._api_key, "action": action, **params}
         try:
             response = self._http_get(
-                HERO_SMS_API_BASE,
+                self._api_base,
                 params=query,
                 headers={"User-Agent": "codex-auto-sms-receiver/1.0", "Accept": "application/json,text/plain"},
                 timeout=self._timeout_seconds,
@@ -253,15 +260,15 @@ class HeroPricingClient:
         except Exception as exc:
             # Never echo an HTTP exception: clients commonly include the full
             # URL, which would expose api_key.
-            raise HeroPricingError(f"Hero SMS 网络请求失败（{type(exc).__name__}）") from exc
+            raise HeroPricingError(f"{self._provider_label} 网络请求失败（{type(exc).__name__}）") from exc
 
         status_code = int(getattr(response, "status_code", 0) or 0)
         payload, raw_text = _payload_text(response)
         code = _error_code(payload, raw_text)
         if code:
-            raise HeroPricingError(f"Hero SMS {code}")
+            raise HeroPricingError(f"{self._provider_label} {code}")
         if status_code != 200:
-            raise HeroPricingError(f"Hero SMS HTTP {status_code or 'unknown'}")
+            raise HeroPricingError(f"{self._provider_label} HTTP {status_code or 'unknown'}")
         return payload
 
     def balance(self) -> dict[str, Any]:
@@ -278,7 +285,7 @@ class HeroPricingClient:
         except (InvalidOperation, ValueError):
             amount = Decimal("-1")
         if not amount.is_finite() or amount < 0:
-            raise HeroPricingError("Hero SMS 余额响应格式不正确")
+            raise HeroPricingError(f"{self._provider_label} 余额响应格式不正确")
         amount_text = format(amount.quantize(Decimal("0.0001")).normalize(), "f")
         return {"amount": amount_text}
 
@@ -304,7 +311,7 @@ class HeroPricingClient:
                 except HeroPricingError as exc:
                     failures.append(exc)
             if not payloads:
-                raise failures[-1] if failures else HeroPricingError("Hero SMS 价格查询失败")
+                raise failures[-1] if failures else HeroPricingError(f"{self._provider_label} 价格查询失败")
             tiers = merge_price_tiers(payloads)
             known_stocks = [row["stock"] for row in tiers if isinstance(row.get("stock"), int)]
             results.append(

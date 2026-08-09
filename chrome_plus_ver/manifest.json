@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Codex Auto SMS Receiver Plus",
+  "version": "1.0.0",
+  "description": "Codex Auto SMS Receiver 的 Chrome 侧边栏扩展版。",
+  "action": {
+    "default_title": "Codex Auto SMS Receiver Plus"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "permissions": [
+    "activeTab",
+    "browsingData",
+    "cookies",
+    "debugger",
+    "sidePanel",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

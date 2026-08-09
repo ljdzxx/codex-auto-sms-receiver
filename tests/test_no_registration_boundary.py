@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,6 +80,7 @@ def test_run_codex_only_passes_custom_email_otp_provider(monkeypatch):
 
     class FakeCodex:
         sms_provider = object()
+        logger = logging.getLogger("test.fake_codex")
 
         @staticmethod
         def run_codex_oauth(email, otp_provider, proxy, force):
@@ -87,6 +89,7 @@ def test_run_codex_only_passes_custom_email_otp_provider(monkeypatch):
             return {"ok": True, "status": "success", "file_path": "credential.json"}
 
     monkeypatch.setattr(upstream_bridge, "_ensure_upstream_imports", lambda settings: FakeCodex())
+    monkeypatch.setattr(upstream_bridge, "_browser_flow_available", lambda: False)
     monkeypatch.setattr(
         upstream_bridge,
         "install_hero_sms_patch",
@@ -179,6 +182,7 @@ def test_run_codex_only_passes_password_and_local_totp_without_mailbox(monkeypat
 
     class FakeCodex:
         sms_provider = object()
+        logger = logging.getLogger("test.fake_codex")
 
         @staticmethod
         def run_codex_oauth(
@@ -200,6 +204,7 @@ def test_run_codex_only_passes_password_and_local_totp_without_mailbox(monkeypat
             return {"ok": True, "status": "success", "file_path": "credential.json"}
 
     monkeypatch.setattr(upstream_bridge, "_ensure_upstream_imports", lambda settings: FakeCodex())
+    monkeypatch.setattr(upstream_bridge, "_browser_flow_available", lambda: False)
     monkeypatch.setattr(
         upstream_bridge,
         "install_hero_sms_patch",

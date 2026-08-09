@@ -129,7 +129,7 @@ def test_pipeline_honors_concurrency_and_retries_only_transient_failures(tmp_pat
 
     assert finished["status"] == "completed"
     assert finished["counts"]["success"] == 3
-    assert maximum_active == 2
+    assert maximum_active == 1
     assert attempts[emails[0]] == 2
     jobs = {row["email"]: row for row in manager.list_jobs()}
     assert jobs[emails[0]]["attempt"] == 2
@@ -244,15 +244,13 @@ def test_pipeline_pause_finishes_inflight_and_resume_dispatches_queue(tmp_path: 
     assert manager.resume_pipeline(pipeline["id"]) is False
 
 
-def test_pipeline_rejects_unsafe_limits_and_second_active_batch(tmp_path: Path):
+def test_pipeline_forces_serial_execution_and_rejects_second_active_batch(tmp_path: Path):
     mailbox_store, emails = _mailboxes(tmp_path, count=1)
     manager = CodexJobManager(_settings(tmp_path), mailbox_store)
     manager.availability = lambda: {"available": True, "reason": ""}
 
-    with pytest.raises(ValueError, match="并发"):
-        manager.start_batch(emails, concurrency=4)
     with pytest.raises(ValueError, match="失败重试"):
-        manager.start_batch(emails, retry_limit=4)
+        manager.start_batch(emails, retry_limit=100)
 
     blocker = threading.Event()
 
@@ -266,11 +264,50 @@ def test_pipeline_rejects_unsafe_limits_and_second_active_batch(tmp_path: Path):
         }
 
     _install_fake_workers(manager, handler=handler, worker_count=1)
-    pipeline = manager.start_batch(emails)
+    pipeline = manager.start_batch(emails, concurrency=4)
+    assert pipeline["concurrency"] == 1
     _wait_for(lambda: manager.pipeline_overview(pipeline["id"])["counts"].get("running"))
     with pytest.raises(RuntimeError, match="已有流水线"):
         manager.start_batch(emails)
     blocker.set()
+
+
+def test_login_only_mode_flags_single_mailbox_and_rejects_multiple(tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=2)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+    dispatched: list[dict] = []
+
+    def handler(task):
+        dispatched.append(task["mailbox"])
+        Path(task["log_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(task["log_path"]).write_text("logged in", encoding="utf-8")
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {"ok": True, "status": "success", "message": "已登录 ChatGPT"},
+        }
+
+    with pytest.raises(ValueError, match="仅登录"):
+        manager.start_batch(emails, concurrency=1, mode="login")
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(emails[:1], concurrency=1, mode="login")
+    # 前端靠 pipeline.mode 判断"仅登录"，从而跳过任务完成后的浏览器清理
+    assert pipeline["mode"] == "login"
+
+    def completed_pipeline():
+        value = manager.pipeline_overview(pipeline["id"])
+        return value if not value["active"] else None
+
+    finished = _wait_for(completed_pipeline)
+    assert finished["counts"]["success"] == 1
+    assert len(dispatched) == 1
+    assert dispatched[0]["login_only"] is True
+    assert "export_session" not in dispatched[0]
+    # 仅登录不产出凭证文件
+    assert manager.list_jobs()[0]["has_credential"] is False
 
 
 def test_generic_mailbox_timeouts_and_proxy_errors_are_retryable(tmp_path: Path):
@@ -374,3 +411,83 @@ def test_public_job_ignores_deleted_or_outside_log_paths(tmp_path: Path):
     )
     assert public["has_log"] is False
     assert public["log_count"] == 0
+
+
+def test_gcash_mode_requires_saved_tabs_and_forwards_them_to_the_worker(tmp_path: Path):
+    from src.gcash_store import GcashTabStore
+
+    mailbox_store, emails = _mailboxes(tmp_path, count=2)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+
+    with pytest.raises(ValueError, match="绑定"):
+        manager.start_batch(emails, concurrency=1, mode="gcash")
+
+    GcashTabStore(tmp_path / "data").save(login_tab_id=101, extract_tab_id=202)
+    dispatched: list[dict] = []
+
+    def handler(task):
+        dispatched.append(task["mailbox"])
+        Path(task["log_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(task["log_path"]).write_text("gcash", encoding="utf-8")
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {"ok": True, "status": "success", "message": "gcash 提炼成功"},
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(emails, concurrency=1, mode="gcash")
+    # 前端靠 pipeline.mode 跳过收尾清理（会打断绑定的标签页）
+    assert pipeline["mode"] == "gcash"
+
+    finished = _wait_for(
+        lambda: (lambda value: value if not value["active"] else None)(
+            manager.pipeline_overview(pipeline["id"])
+        )
+    )
+    assert finished["counts"]["success"] == 2
+    assert len(dispatched) == 2
+    for mailbox in dispatched:
+        assert mailbox["gcash_extract"] is True
+        assert (mailbox["gcash_login_tab_id"], mailbox["gcash_extract_tab_id"]) == (101, 202)
+        assert "login_only" not in mailbox and "export_session" not in mailbox
+
+
+def test_gcash_extraction_failure_is_never_retried(tmp_path: Path):
+    from src.gcash_store import GcashTabStore
+
+    mailbox_store, emails = _mailboxes(tmp_path, count=1)
+    GcashTabStore(tmp_path / "data").save(login_tab_id=1, extract_tab_id=2)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+    attempts: list[int] = []
+
+    def handler(task):
+        attempts.append(task["attempt"])
+        Path(task["log_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(task["log_path"]).write_text("failed", encoding="utf-8")
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {
+                "ok": False,
+                "status": "failed",
+                # 消息里带 "超时" —— 若没有 gcash_extract_failed 分类会被误判成可重试
+                "message": "gcash_extract_failed：付款链接已打开但未等到扫码完成（超时）",
+            },
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(emails, concurrency=1, retry_limit=3, mode="gcash")
+
+    finished = _wait_for(
+        lambda: (lambda value: value if not value["active"] else None)(
+            manager.pipeline_overview(pipeline["id"])
+        )
+    )
+    assert finished["counts"]["failed"] == 1
+    assert attempts == [1]
+    assert manager.list_jobs()[0]["failure_code"] == "gcash_extract_failed"

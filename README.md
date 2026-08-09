@@ -82,7 +82,7 @@ Linux / macOS：
 cp .env.example .env
 ```
 
-可以直接编辑 `.env`，也可以在 WebUI 中配置 HeroSMS。最少需要设置：
+可以直接编辑 `.env`，也可以在 Chrome 扩展侧边栏中配置 HeroSMS。最少需要设置：
 
 ```dotenv
 HERO_SMS_API_KEY=your_api_key
@@ -98,9 +98,9 @@ HERO_SMS_MAX_PRICE=0.11
 python app.py --host 127.0.0.1 --port 5015
 ```
 
-浏览器访问：<http://127.0.0.1:5015>
+启动后 UI 由 Chrome 扩展提供：在 `chrome://extensions` 加载 `chrome_plus_ver/` 目录，打开扩展侧边栏即可操作（后端本身只提供 JSON API，访问 `http://127.0.0.1:5015` 只会返回提示 JSON）。
 
-WebUI 不设登录密码，因此程序只允许监听本机回环地址。请勿通过反向代理、端口转发或其他方式将控制台暴露到局域网或公网。
+后端 API 不设登录密码，因此程序只允许监听本机回环地址。请勿通过反向代理、端口转发或其他方式将服务暴露到局域网或公网。
 
 ## 账号导入
 
@@ -168,7 +168,7 @@ email|ChatGPT密码|Base32格式的2FA密钥
 
 ## HeroSMS 配置
 
-WebUI 支持搜索 HeroSMS 国家目录，并将最多 10 个国家加入优先队列。运行时严格按照队列顺序取号；当前国家无库存时自动尝试下一个国家。
+扩展侧边栏支持搜索 HeroSMS 国家目录，并将最多 10 个国家加入优先队列。运行时严格按照队列顺序取号；当前国家无库存时自动尝试下一个国家。
 
 | 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
@@ -187,7 +187,7 @@ WebUI 支持搜索 HeroSMS 国家目录，并将最多 10 个国家加入优先�
 - **多格式导出**：批量凭证支持 Codex 原始 JSON 压缩包和 Sub2API `sub2api-data` JSON；账号清单支持按 Outlook、通用 API、验证码 URL、密码 + TOTP 的原导入格式分别导出 TXT
 - **批量管理**：账号和凭证均可多选、取消选择和删除；删除凭证会保留账号登录素材，删除账号会保留已归档凭证
 - **安全下载**：导出账号素材或完整 Token 前均需要二次确认
-- **日志查看**：支持搜索、级别筛选、分页和自动刷新；WebUI 会隐藏 API Key、Token、OTP、OAuth 参数及完整手机号
+- **日志查看**：支持搜索、级别筛选、分页和自动刷新；界面会隐藏 API Key、Token、OTP、OAuth 参数及完整手机号
 - **接码统计**：汇总取号、短信发送、收码、验证结果、国家、报价和失败原因
 - **日志保留**：默认保留 30 天，最多 1000 个文件，总量不超过 200 MB
 
@@ -226,8 +226,8 @@ SMS_PROVIDER=hero
 
 ```text
 app.py                         应用入口
-src/                           WebUI、任务调度、邮箱与 HeroSMS 集成
-templates/                     WebUI 页面
+src/                           后端 API、任务调度、邮箱与 HeroSMS 集成
+chrome_plus_ver/               Chrome 扩展（唯一的操作界面）
 tests/                         自动化测试
 vendor/turb-gpt-free-register/ OAuth、OTP 与 Sentinel 运行时快照
 data/                          本地账号、状态与凭证（不入库）
@@ -246,7 +246,7 @@ python -m pytest -q
 
 项目内置了 [`myfanhua/turb-gpt-free-register`](https://github.com/myfanhua/turb-gpt-free-register) 在提交 `9e00a7b0a8cf9e77edc265c1883f68f1a321b2da` 的运行快照及上游许可证。
 
-本项目只调用 `core.codex_oauth.run_codex_oauth()`，不会调用账号注册入口。vendor 快照为保持上游导入兼容性保留了部分未使用模块，但这些模块没有接入本项目的 WebUI、任务调度或启动入口。具体信息参见 [`vendor/turb-gpt-free-register/UPSTREAM.md`](vendor/turb-gpt-free-register/UPSTREAM.md)。
+本项目只调用 `core.codex_oauth.run_codex_oauth()`，不会调用账号注册入口。vendor 快照为保持上游导入兼容性保留了部分未使用模块，但这些模块没有接入本项目的后端 API、任务调度或启动入口。具体信息参见 [`vendor/turb-gpt-free-register/UPSTREAM.md`](vendor/turb-gpt-free-register/UPSTREAM.md)。
 
 ## 免责声明
 

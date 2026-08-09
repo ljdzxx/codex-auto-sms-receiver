@@ -1235,8 +1235,12 @@ def _credential_file_name(email: str, plan_type: str) -> str:
 
 
 def save_codex_credential(storage: dict, email: str, plan_type: str) -> Path:
-    """落盘到 {PROJECT_ROOT}/{CODEX_OUTPUT_DIRNAME}/codex-{email}.json。"""
-    out_dir = _PROJECT_ROOT / _cfg.CODEX_OUTPUT_DIRNAME
+    """落盘到 {PROJECT_ROOT}/{CODEX_OUTPUT_DIRNAME}/{YYYY-MM-DD}/codex-{email}.json。
+
+    按日期分子目录归档，便于按批次/天检索；读取侧（artifact_store）已做递归扫描。
+    """
+    day = datetime.now().strftime("%Y-%m-%d")
+    out_dir = _PROJECT_ROOT / _cfg.CODEX_OUTPUT_DIRNAME / day
     out_dir.mkdir(parents=True, exist_ok=True)
     fname = _credential_file_name(email, plan_type)
     path = out_dir / fname

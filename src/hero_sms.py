@@ -25,7 +25,12 @@ from .hero_pricing import (
     filter_price_tiers,
     merge_price_tiers,
 )
-from .sms_config import normalize_hero_countries
+from .sms_config import normalize_channel_priority, normalize_hero_countries
+
+
+# smsbower shares the SMS-Activate text protocol but uses a different base URL
+# and native ACCESS_NUMBER / STATUS_* replies (no JSON normalization needed).
+SMSBOWER_API_BASE = "https://smsbower.page/stubs/handler_api.php"
 
 
 class HeroSmsError(RuntimeError):
@@ -264,6 +269,61 @@ class HeroSmsAdapter:
         raise self._provider_error(message)
 
 
+class SmsbowerAdapter(HeroSmsAdapter):
+    """smsbower speaks the native SMS-Activate text protocol.
+
+    It reuses Hero's error-token detection and redaction, but talks to the
+    smsbower base URL and returns the raw ``ACCESS_NUMBER`` / ``STATUS_*``
+    text verbatim (no JSON normalization or ``service`` rewriting).
+    """
+
+    def query(
+        self,
+        http: Any,
+        params: Mapping[str, Any],
+        *,
+        include_request: bool = False,
+    ) -> Any:
+        if not self._api_key:
+            raise self._provider_error("smsbower API key is empty")
+        request_params = {**dict(params), "api_key": self._api_key}
+        try:
+            response = http.get(SMSBOWER_API_BASE, params=request_params)
+        except Exception as exc:
+            raise self._provider_error(
+                f"smsbower request failed ({type(exc).__name__})"
+            ) from exc
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        raw_text = str(getattr(response, "text", "") or "").strip()
+
+        error = self._error_from(raw_text, raw_text)
+        if error is not None:
+            self._raise_error(*error)
+        if status_code != 200:
+            if status_code == 401:
+                self._raise_error("BAD_KEY", "Unauthorized")
+            if status_code == 402:
+                self._raise_error("NO_BALANCE", "Payment Required")
+            raise self._provider_error(f"smsbower HTTP {status_code or 'unknown'}")
+        if include_request:
+            return request_params, raw_text, raw_text
+        return raw_text
+
+    def _normalize_success(
+        self,
+        action: str,
+        payload: Any,
+        raw_text: str,
+        request_params: Mapping[str, Any],
+    ) -> str:
+        text = str(payload if isinstance(payload, str) else raw_text or "").strip()
+        if text:
+            return text
+        raise self._provider_error(
+            f"smsbower {action or 'request'} returned an empty response"
+        )
+
+
 def _env_price(name: str, legacy_name: str = "") -> Decimal | None:
     raw = str(os.getenv(name, "") or "").strip()
     if not raw and legacy_name:
@@ -283,6 +343,40 @@ def _price_text(value: Decimal | None) -> str:
     return format(value.quantize(Decimal("0.0001")).normalize(), "f")
 
 
+def _country_price_map(env_name: str) -> dict[str, dict]:
+    """Read a per-country price map (JSON) from the environment.
+
+    Keyed by country id -> ``{"max": "0.10", "fixed": bool}`` (Hero) or
+    ``{"min"?: "0.05", "max": "0.20"}`` (smsbower). Returns {} when unset/bad.
+    """
+    raw = str(os.getenv(env_name, "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, dict] = {}
+    for key, entry in data.items():
+        country = str(key).strip()
+        if country.isdigit() and isinstance(entry, dict):
+            result[str(int(country))] = entry
+    return result
+
+
+def _country_price_decimal(entry: dict | None, field: str) -> Decimal | None:
+    raw = str((entry or {}).get(field, "") or "").strip()
+    if not re.fullmatch(r"(?:0|[1-9]\d*)(?:\.\d{1,4})?", raw):
+        return None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return value if value.is_finite() and value > 0 else None
+
+
 def _env_boolean(name: str, default: bool = False) -> bool:
     value = str(os.getenv(name, "") or "").strip().lower()
     if value in {"1", "true", "yes", "on"}:
@@ -296,6 +390,7 @@ def _env_boolean(name: str, default: bool = False) -> bool:
 class _ActivationRoute:
     status_action: str = "getStatus"
     country: str = ""
+    channel: str = "hero"
     acquired_at: float = field(default_factory=time.time)
 
 
@@ -307,13 +402,27 @@ class _RuntimeSmsCoordinator:
         module: ModuleType | Any,
         adapter: HeroSmsAdapter,
         original_functions: Mapping[str, Any],
+        channels: Mapping[str, HeroSmsAdapter] | None = None,
     ) -> None:
         self.module = module
         self.adapter = adapter
+        # channels maps a channel name -> its adapter. Hero is always present
+        # and points at the primary adapter so hero-only installs behave
+        # exactly as before; smsbower is added only when configured.
+        self.channels: dict[str, HeroSmsAdapter] = {"hero": adapter}
+        if channels:
+            self.channels.update(channels)
         self.original_functions = dict(original_functions)
         self._lock = threading.RLock()
         self._routes: dict[str, _ActivationRoute] = {}
-        self._country_cursor = 0
+        # Per-channel round-robin country cursor. After a channel successfully
+        # buys a number in a country, its cursor advances one step so the next
+        # acquisition for that channel starts at the following country. Hero and
+        # smsbower each keep their own cursor (symmetric behavior).
+        self._country_cursors: dict[str, int] = {}
+
+    def _adapter_for(self, channel: str | None) -> HeroSmsAdapter:
+        return self.channels.get(str(channel or "hero").strip().lower() or "hero", self.adapter)
 
     def route_for(self, activation_id: Any) -> _ActivationRoute | None:
         key = str(activation_id or "").strip()
@@ -341,7 +450,27 @@ class _RuntimeSmsCoordinator:
             and route.status_action == "getStatusV2"
         ):
             request_params["action"] = "getStatusV2"
-        return self.adapter.request(http, request_params)
+        adapter = self._adapter_for(route.channel if route is not None else "hero")
+        return adapter.request(http, request_params)
+
+    def _rotate_by_cursor(self, channel: str, countries: list[str]) -> list[str]:
+        """Rotate a country queue so it starts at the channel's cursor position."""
+        if not countries:
+            return countries
+        with self._lock:
+            cursor = self._country_cursors.get(channel, 0) % len(countries)
+        return [*countries[cursor:], *countries[:cursor]]
+
+    def _advance_cursor(self, channel: str, configured: list[str], acquired_country: str) -> None:
+        """Move a channel's cursor to the country after the one just acquired."""
+        if not configured:
+            return
+        try:
+            next_index = (configured.index(str(acquired_country)) + 1) % len(configured)
+        except ValueError:
+            return
+        with self._lock:
+            self._country_cursors[channel] = next_index
 
     def _hero_countries(self, requested_country: Any = None) -> list[str]:
         fallback = [requested_country] if str(requested_country or "").strip() else []
@@ -355,9 +484,7 @@ class _RuntimeSmsCoordinator:
             requested = str(int(requested))
             countries = [requested, *(item for item in countries if item != requested)]
         elif countries:
-            with self._lock:
-                cursor = self._country_cursor % len(countries)
-            countries = [*countries[cursor:], *countries[:cursor]]
+            countries = self._rotate_by_cursor("hero", countries)
         if not countries:
             provider_error = getattr(self.module, "SmsProviderError", HeroSmsError)
             raise provider_error("Hero-SMS requires at least one configured country")
@@ -368,14 +495,7 @@ class _RuntimeSmsCoordinator:
             configured = normalize_hero_countries(os.getenv("HERO_SMS_COUNTRIES", ""))
         except ValueError:
             configured = []
-        if not configured:
-            return
-        try:
-            next_index = (configured.index(str(acquired_country)) + 1) % len(configured)
-        except ValueError:
-            return
-        with self._lock:
-            self._country_cursor = next_index
+        self._advance_cursor("hero", configured, acquired_country)
 
     def _hero_price_candidates(self, http: Any, country: str) -> tuple[list[Decimal], bool]:
         payloads: list[Any] = []
@@ -437,6 +557,9 @@ class _RuntimeSmsCoordinator:
         country: str | None = None,
     ) -> tuple[str, str, _ActivationRoute]:
         countries = self._hero_countries(country)
+        # Per-country prices are authoritative when configured (每国必填). Fall
+        # back to the legacy channel-wide envs only if the map is empty.
+        country_prices = _country_price_map("HERO_SMS_COUNTRY_PRICES")
         minimum = _env_price("HERO_SMS_MIN_PRICE")
         maximum = _env_price("HERO_SMS_MAX_PRICE", "SMS_MAX_PRICE")
         preferred = _env_price("HERO_SMS_PREFERRED_PRICE")
@@ -480,6 +603,12 @@ class _RuntimeSmsCoordinator:
 
         last_error: Exception | None = None
         for attempt in attempts:
+            # Per-country cap/fixed override the channel-wide values for this
+            # country when the per-country map has an entry for it.
+            country_entry = country_prices.get(str(attempt["country"]))
+            country_cap = _country_price_decimal(country_entry, "max")
+            country_fixed = bool((country_entry or {}).get("fixed")) if country_entry else False
+            effective_cap = country_cap if country_cap is not None else maximum
             prices: list[Decimal | None] = list(attempt["prices"])
             if not prices:
                 # A minimum cannot be enforced by Hero's legacy getNumber API
@@ -496,19 +625,24 @@ class _RuntimeSmsCoordinator:
                         "service": service or HERO_SMS_SERVICE_CODE,
                         "country": attempt["country"],
                     }
-                    if price is not None:
+                    if country_cap is not None:
+                        # Per-country config wins: cap at the country's max, and
+                        # apply its own fixedPrice flag (default False).
+                        params["maxPrice"] = _price_text(country_cap)
+                        if country_fixed:
+                            params["fixedPrice"] = "true"
+                    elif price is not None:
                         params["maxPrice"] = _price_text(price)
                         params["fixedPrice"] = "true"
-                    elif maximum is not None:
-                        params["maxPrice"] = _price_text(maximum)
+                    elif effective_cap is not None:
+                        params["maxPrice"] = _price_text(effective_cap)
                     logger = getattr(self.module, "logger", None)
                     if logger is not None:
                         logger.info(
-                            "[SMS:Hero] trying country=%s price=%s action=%s priority=%s",
+                            "[SMS:Hero] trying country=%s price=%s fixed=%s action=%s priority=%s",
                             attempt["country"],
-                            _price_text(price) if price is not None else (
-                                f"<= {_price_text(maximum)}" if maximum is not None else "auto"
-                            ),
+                            params.get("maxPrice") or "auto",
+                            params.get("fixedPrice", "false"),
                             action,
                             priority,
                         )
@@ -557,17 +691,157 @@ class _RuntimeSmsCoordinator:
         no_numbers = getattr(self.module, "SmsNoNumbersError", HeroSmsNoNumbersError)
         raise no_numbers("Hero-SMS no numbers within the configured country/price range")
 
+    def acquire_smsbower(
+        self,
+        http: Any,
+        *,
+        service: str | None = None,
+        country: str | None = None,
+    ) -> tuple[str, str, _ActivationRoute]:
+        adapter = self.channels["smsbower"]
+        fallback = [country] if str(country or "").strip() else []
+        try:
+            countries = normalize_hero_countries(
+                os.getenv("SMSBOWER_COUNTRIES", ""), fallback=fallback
+            )
+        except ValueError:
+            countries = []
+        if not countries:
+            provider_error = getattr(self.module, "SmsProviderError", HeroSmsError)
+            raise provider_error("smsbower requires at least one configured country")
+
+        # Symmetric to Hero: pin an explicitly requested country first, otherwise
+        # rotate the queue by smsbower's own cursor so retries move to the next
+        # country instead of hammering the first one.
+        configured = list(countries)
+        requested = str(country or "").strip()
+        if requested.isdigit():
+            requested = str(int(requested))
+            countries = [requested, *(item for item in countries if item != requested)]
+        else:
+            countries = self._rotate_by_cursor("smsbower", countries)
+
+        minimum = _env_price("SMSBOWER_MIN_PRICE")
+        maximum = _env_price("SMSBOWER_MAX_PRICE")
+        country_prices = _country_price_map("SMSBOWER_COUNTRY_PRICES")
+        last_error: Exception | None = None
+        for country_id in countries[:10]:
+            # Per-country min/max override the channel-wide values when set.
+            country_entry = country_prices.get(str(country_id))
+            country_min = _country_price_decimal(country_entry, "min")
+            country_max = _country_price_decimal(country_entry, "max")
+            effective_min = country_min if country_min is not None else minimum
+            effective_max = country_max if country_max is not None else maximum
+            params: dict[str, Any] = {
+                "action": "getNumber",
+                "service": service or HERO_SMS_SERVICE_CODE,
+                "country": country_id,
+            }
+            if effective_min is not None:
+                params["minPrice"] = _price_text(effective_min)
+            if effective_max is not None:
+                params["maxPrice"] = _price_text(effective_max)
+            logger = getattr(self.module, "logger", None)
+            if logger is not None:
+                logger.info(
+                    "[SMS:smsbower] trying country=%s minPrice=%s maxPrice=%s",
+                    country_id,
+                    params.get("minPrice", "-"),
+                    params.get("maxPrice", "-"),
+                )
+            try:
+                text = adapter.request(http, params)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if not text.startswith("ACCESS_NUMBER:"):
+                last_error = getattr(self.module, "SmsProviderError", HeroSmsError)(
+                    "smsbower getNumber returned an unexpected response"
+                )
+                continue
+            parts = text.split(":", 2)
+            if len(parts) != 3 or not parts[1].strip() or not _phone_digits(parts[2]):
+                last_error = getattr(self.module, "SmsProviderError", HeroSmsError)(
+                    "smsbower getNumber returned an invalid activation"
+                )
+                continue
+            activation_id = parts[1].strip()
+            phone = _phone_digits(parts[2])
+            acquired = getattr(self.module, "_ACQUIRED_AT", None)
+            if isinstance(acquired, dict):
+                acquired[activation_id] = time.time()
+            self._advance_cursor("smsbower", configured, country_id)
+            if logger is not None:
+                logger.info(
+                    "[SMS:smsbower] acquired country=%s activation_id=%s",
+                    country_id,
+                    activation_id,
+                )
+            return activation_id, phone, _ActivationRoute(
+                status_action="getStatus",
+                country=country_id,
+                channel="smsbower",
+            )
+        if last_error is not None:
+            raise last_error
+        no_numbers = getattr(self.module, "SmsNoNumbersError", HeroSmsNoNumbersError)
+        raise no_numbers("smsbower no numbers within the configured country/price range")
+
+    def _channel_order(self) -> list[str]:
+        try:
+            order = normalize_channel_priority(
+                os.getenv("SMS_CHANNEL_PRIORITY", ""), allowed=self.channels.keys()
+            )
+        except ValueError:
+            order = []
+        # Only channels with an installed adapter can be used; always fall back
+        # to hero so a missing/blank priority behaves exactly as hero-only.
+        order = [name for name in order if name in self.channels]
+        if not order:
+            return ["hero"]
+        if "hero" in self.channels and "hero" not in order:
+            order.append("hero")
+        return order
+
+    def _acquire_channel(
+        self,
+        channel: str,
+        http: Any,
+        *,
+        service: str | None,
+        country: str | None,
+    ) -> tuple[str, str, _ActivationRoute]:
+        if channel == "smsbower":
+            return self.acquire_smsbower(http, service=service, country=country)
+        return self.acquire_hero(http, service=service, country=country)
+
     def acquire_number(self, http: Any = None, service: str | None = None, country: str | None = None):
         own_http = http is None
         http = http or self.module._http()
         try:
-            activation_id, phone, route = self.acquire_hero(
-                http,
-                service=service,
-                country=country,
-            )
-            self.remember(activation_id, route)
-            return activation_id, phone
+            order = self._channel_order()
+            last_error: Exception | None = None
+            for channel in order:
+                try:
+                    activation_id, phone, route = self._acquire_channel(
+                        channel, http, service=service, country=country
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    logger = getattr(self.module, "logger", None)
+                    if logger is not None:
+                        logger.warning(
+                            "[SMS] channel %s could not acquire a number (%s); trying next priority",
+                            channel,
+                            type(exc).__name__,
+                        )
+                    continue
+                self.remember(activation_id, route)
+                return activation_id, phone
+            if last_error is not None:
+                raise last_error
+            no_numbers = getattr(self.module, "SmsNoNumbersError", HeroSmsNoNumbersError)
+            raise no_numbers("No SMS channel could acquire a number")
         finally:
             if own_http:
                 try:
@@ -602,6 +876,7 @@ class _RuntimeSmsCoordinator:
             route = _ActivationRoute(
                 acquired_at=float(acquired_at) if acquired_at is not None else time.time()
             )
+        adapter = self._adapter_for(route.channel)
         supplied_http = kwargs.get("http") or (args[0] if args else None)
         background = args[1] if len(args) > 1 else kwargs.get("background", True)
 
@@ -615,7 +890,7 @@ class _RuntimeSmsCoordinator:
             try:
                 for attempt in range(2):
                     try:
-                        self.adapter.request(
+                        adapter.request(
                             http,
                             {"action": "setStatus", "status": "8", "id": str(activation_id)},
                         )
@@ -630,7 +905,7 @@ class _RuntimeSmsCoordinator:
                         else:
                             logger = getattr(self.module, "logger", None)
                             if logger is not None:
-                                logger.warning("[SMS:Hero] cancel failed (%s)", type(exc).__name__)
+                                logger.warning("[SMS:%s] cancel failed (%s)", route.channel, type(exc).__name__)
             finally:
                 if own_http:
                     try:
@@ -662,6 +937,9 @@ class HeroSmsPatch:
     original_functions: dict[str, Any] = field(default_factory=dict)
     patched_functions: dict[str, Any] = field(default_factory=dict)
     coordinator: Any = field(default=None, repr=False)
+    route_for_existed: bool = field(default=False, repr=False)
+    original_route_for: Any = field(default=None, repr=False)
+    patched_route_for: Any = field(default=None, repr=False)
     _restored: bool = field(default=False, init=False, repr=False)
 
     def restore(self) -> None:
@@ -671,6 +949,14 @@ class HeroSmsPatch:
             for name, original in self.original_functions.items():
                 if getattr(self.module, name, None) is self.patched_functions.get(name):
                     setattr(self.module, name, original)
+            if self.patched_route_for is not None and getattr(self.module, "route_for", None) is self.patched_route_for:
+                if self.route_for_existed:
+                    setattr(self.module, "route_for", self.original_route_for)
+                else:
+                    try:
+                        delattr(self.module, "route_for")
+                    except AttributeError:
+                        pass
             if getattr(self.module, "_request_grizzly", None) is self.patched_request:
                 self.module._request_grizzly = self.original_request
             self._restored = True
@@ -690,6 +976,20 @@ def install_hero_sms_patch(sms_provider: ModuleType | Any) -> HeroSmsPatch:
         no_balance_error=sms_provider.SmsNoBalanceError,
     )
 
+    # smsbower is optional and purely additive: it is only wired in when both
+    # an API key and country list are configured, so hero-only installs are
+    # unchanged.
+    extra_channels: dict[str, HeroSmsAdapter] = {}
+    smsbower_key = str(os.getenv("SMSBOWER_API_KEY", "") or "").strip()
+    smsbower_countries = str(os.getenv("SMSBOWER_COUNTRIES", "") or "").strip()
+    if smsbower_key and smsbower_countries:
+        extra_channels["smsbower"] = SmsbowerAdapter(
+            smsbower_key,
+            provider_error=sms_provider.SmsProviderError,
+            no_numbers_error=sms_provider.SmsNoNumbersError,
+            no_balance_error=sms_provider.SmsNoBalanceError,
+        )
+
     with _PATCH_LOCK:
         original = sms_provider._request_grizzly
         lifecycle_names = (
@@ -708,6 +1008,7 @@ def install_hero_sms_patch(sms_provider: ModuleType | Any) -> HeroSmsPatch:
             sms_provider,
             adapter,
             original_functions,
+            channels=extra_channels or None,
         )
 
         def hero_request(http: Any, params: Mapping[str, Any]) -> str:
@@ -721,6 +1022,20 @@ def install_hero_sms_patch(sms_provider: ModuleType | Any) -> HeroSmsPatch:
             patched = getattr(coordinator, name)
             patched_functions[name] = patched
             setattr(sms_provider, name, patched)
+        # Expose the coordinator's route lookup on the module so callers can tell
+        # which channel (hero vs smsbower) actually acquired an activation. It is
+        # additive — the upstream module has no route_for — and removed on
+        # restore. Without this the caller always falls back to the default
+        # provider name ("hero") and mislabels smsbower numbers / picks the wrong
+        # per-channel SMS timeout.
+        route_for_existed = hasattr(sms_provider, "route_for")
+        original_route_for = getattr(sms_provider, "route_for", None)
+        # Bind once: ``coordinator.route_for`` yields a fresh bound-method object
+        # on every access, so the value stored on the module must be the exact
+        # same reference the patch remembers — otherwise restore's identity check
+        # never matches and the attribute leaks.
+        route_for_bound = coordinator.route_for
+        sms_provider.route_for = route_for_bound
         return HeroSmsPatch(
             module=sms_provider,
             original_request=original,
@@ -728,6 +1043,9 @@ def install_hero_sms_patch(sms_provider: ModuleType | Any) -> HeroSmsPatch:
             original_functions=original_functions,
             patched_functions=patched_functions,
             coordinator=coordinator,
+            route_for_existed=route_for_existed,
+            original_route_for=original_route_for,
+            patched_route_for=route_for_bound,
         )
 
 
@@ -738,5 +1056,7 @@ __all__ = [
     "HeroSmsNoBalanceError",
     "HeroSmsNoNumbersError",
     "HeroSmsPatch",
+    "SMSBOWER_API_BASE",
+    "SmsbowerAdapter",
     "install_hero_sms_patch",
 ]
