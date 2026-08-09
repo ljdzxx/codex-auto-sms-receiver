@@ -251,3 +251,47 @@ def test_access_token_falls_back_to_reading_the_session_endpoint(monkeypatch):
     )
 
     assert upstream_bridge._read_gcash_access_token(LOGGER, {"user": {"id": "u"}}) == "tok-fetch"
+
+
+def test_submit_login_step_defers_bridge_timeout_to_session_confirm(monkeypatch):
+    # A 浏览器桥接超时 on a login submit must NOT fail the job: the login often
+    # already succeeded (page jumped away, throttled frame never reported back).
+    # It should return frame_teardown=True so the caller confirms via /session.
+    def boom(action, **payload):
+        raise RuntimeError("浏览器桥接超时：page_action")
+
+    monkeypatch.setattr(upstream_bridge, "_bridge_page_action", boom)
+
+    result = upstream_bridge._submit_login_step(
+        "submit_mfa_totp", label="登录", step="提交 TOTP 验证码", logger=LOGGER, code="123456"
+    )
+
+    assert result["frame_teardown"] is True
+    assert "浏览器桥接超时" in result["teardown_error"]
+
+
+def test_submit_login_step_defers_frame_teardown_to_session_confirm(monkeypatch):
+    def boom(action, **payload):
+        raise RuntimeError("Frame with ID 0 was removed.")
+
+    monkeypatch.setattr(upstream_bridge, "_bridge_page_action", boom)
+
+    result = upstream_bridge._submit_login_step(
+        "submit_mfa_totp", label="登录", step="提交 TOTP 验证码", logger=LOGGER, code="123456"
+    )
+
+    assert result["frame_teardown"] is True
+
+
+def test_submit_login_step_reraises_a_real_error(monkeypatch):
+    # A genuine page-level failure (not teardown, not a bridge timeout) must
+    # still propagate so the job fails instead of silently confirming.
+    def boom(action, **payload):
+        raise RuntimeError("TOTP 2FA 验证失败：代码不正确")
+
+    monkeypatch.setattr(upstream_bridge, "_bridge_page_action", boom)
+
+    with pytest.raises(RuntimeError, match="代码不正确"):
+        upstream_bridge._submit_login_step(
+            "submit_mfa_totp", label="登录", step="提交 TOTP 验证码", logger=LOGGER, code="123456"
+        )

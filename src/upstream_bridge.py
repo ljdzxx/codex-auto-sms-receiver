@@ -673,18 +673,36 @@ def _submit_login_step(action: str, *, label: str, step: str, logger, **payload)
 
     Returns the bridge result, or ``{"frame_teardown": True}`` when the frame
     died mid-navigation — the caller then confirms the outcome via the session
-    endpoint instead of treating it as a failure."""
+    endpoint instead of treating it as a failure.
+
+    A ``浏览器桥接超时`` on the submit is treated the same way: the login often
+    DID succeed (page jumped to chatgpt.com, the injected frame died in a
+    throttled background tab, and the bridge hit its 120s cap before the step
+    could report back). Failing outright here would throw away a good login;
+    instead defer to ``_confirm_logged_in``, which reads the session endpoint and
+    is the single source of truth. If the login really didn't happen it just
+    fails there after genuinely checking, so this never fabricates success."""
     try:
         return _bridge_page_action(action, **payload)
     except RuntimeError as exc:
-        if not _is_frame_teardown_error(exc):
+        teardown = _is_frame_teardown_error(exc)
+        bridge_timeout = "浏览器桥接超时" in str(exc)
+        if not teardown and not bridge_timeout:
             raise
-        logger.info(
-            "[Codex] %s：%s 后注入帧被销毁（页面正在跳转），改用 session 接口确认结果：%s",
-            label,
-            step,
-            str(exc)[:160],
-        )
+        if bridge_timeout and not teardown:
+            logger.warning(
+                "[Codex] %s：%s 桥接超时（可能页面已跳转、注入帧在后台被节流未回信），改用 session 接口确认结果：%s",
+                label,
+                step,
+                str(exc)[:160],
+            )
+        else:
+            logger.info(
+                "[Codex] %s：%s 后注入帧被销毁（页面正在跳转），改用 session 接口确认结果：%s",
+                label,
+                step,
+                str(exc)[:160],
+            )
         return {"ok": True, "frame_teardown": True, "error_text": "", "teardown_error": str(exc)}
 
 
