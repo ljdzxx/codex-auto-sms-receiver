@@ -6,3 +6,8 @@ pyotp>=2.9
 pycryptodome>=3.23
 cryptography>=41
 requests>=2.31
+PySocks>=1.7
+# 二维码解码：MFA 那步读不到 Base32 密钥时，直接把弹窗里的二维码截下来解成
+# otpauth:// 再取密钥。没装也能跑（会降级成"等人工把密钥显示出来"），但装上
+# 能省掉大部分人工介入。headless 版本不带 GUI 依赖，Windows 上一条命令即可。
+opencv-python-headless>=4.9

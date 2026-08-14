@@ -155,6 +155,74 @@ class _CardInboxParser(HTMLParser):
         self._div_depth -= 1
 
 
+_MAIL_CARD_FIELDS = {"subject": "su", "date": "dt", "meta": "fr", "body": "bd"}
+
+
+class _MailCardInboxParser(HTMLParser):
+    """解析 mail.ai1998.xyz 这类 ``article.mail-card`` 收件箱页面。
+
+    每张卡片是一个 ``<article class="mail-card">``，内含
+    ``span.subject``(主题) / ``span.date``(时间) / ``div.meta``(发件人) /
+    ``pre.body``(邮件正文)。页面按时间倒序展示多封邮件，必须逐卡片
+    带时间做新鲜度筛选，不能整页裸抽数字。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.cards: list[dict[str, str]] = []
+        self._cur: dict[str, list[str]] | None = None
+        self._field: str | None = None
+        self._field_tag: str | None = None
+        self._field_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.casefold()
+        values = {str(key).casefold(): str(value or "") for key, value in attrs}
+        classes = {part.casefold() for part in values.get("class", "").split()}
+        if tag == "article":
+            if self._cur is None and "mail-card" in classes:
+                self._cur = {"fr": [], "su": [], "dt": [], "all": []}
+            return
+        if self._cur is None:
+            return
+        if self._field is not None:
+            if tag == self._field_tag:
+                self._field_depth += 1
+            return
+        for cls, key in _MAIL_CARD_FIELDS.items():
+            if cls in classes:
+                self._field = key
+                self._field_tag = tag
+                self._field_depth = 1
+                break
+
+    def handle_data(self, data: str) -> None:
+        if self._cur is None:
+            return
+        text = data.strip()
+        if not text:
+            return
+        self._cur["all"].append(text)
+        if self._field is not None and self._field != "bd":
+            self._cur.setdefault(self._field, []).append(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if self._cur is None:
+            return
+        if self._field is not None and tag == self._field_tag:
+            self._field_depth -= 1
+            if self._field_depth == 0:
+                self._field = None
+                self._field_tag = None
+            return
+        if tag == "article":
+            self.cards.append(
+                {key: " ".join(parts).strip() for key, parts in self._cur.items()}
+            )
+            self._cur = None
+
+
 def _parse_card_date(text: str) -> float | None:
     raw = str(text or "").strip()
     if not raw:
@@ -193,6 +261,53 @@ def _extract_from_card_inbox(
     for card in parser.cards:
         context = f"{card.get('su', '')} {card.get('fr', '')} {card.get('all', '')}"
         # 只认验证码邮件，避免把普通邮件里的数字当验证码。
+        if not _has_otp_context(context):
+            continue
+        code = _extract_code(card.get("all", ""))
+        if not code:
+            continue
+        if exclude_codes and code in exclude_codes:
+            logger.debug("[GenericAPI] 已跳过上一轮已使用过的验证码邮件")
+            continue
+        received_ts = _parse_card_date(card.get("dt", ""))
+        if after_ts is not None:
+            if received_ts is None:
+                logger.debug("[GenericAPI] 卡片邮件缺少可解析时间，已跳过以避免使用旧验证码")
+                continue
+            if received_ts < after_ts - _FRESHNESS_TOLERANCE_SECONDS:
+                logger.debug("[GenericAPI] 已跳过本次发码前的旧验证码邮件")
+                continue
+        if newest is None or (received_ts or 0.0) >= (newest[0] or 0.0):
+            newest = (received_ts or 0.0, code)
+    return True, (newest[1] if newest else None)
+
+
+def _extract_from_mail_card_inbox(
+    html_text: str,
+    after_ts: float | None = None,
+    exclude_codes: "frozenset[str] | set[str] | None" = None,
+) -> tuple[bool, str | None]:
+    """解析 ``article.mail-card`` 式收件箱（如 mail.ai1998.xyz）。
+
+    页面按时间倒序展示多封邮件（本次踩坑：整页裸抽会命中 09:39 的旧码
+    835012，而正确码在 10:06 的最新邮件里）。逐卡片按 ``.date`` 做新鲜度
+    筛选，取本次发码后最新的一封。返回 ``(recognized, code)``；
+    recognized=True 时禁止再退回裸正则。
+    """
+    if "mail-card" not in html_text:
+        return False, None
+    parser = _MailCardInboxParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        return False, None
+    if not parser.cards:
+        return False, None
+
+    newest: tuple[float, str] | None = None
+    for card in parser.cards:
+        context = f"{card.get('su', '')} {card.get('fr', '')} {card.get('all', '')}"
         if not _has_otp_context(context):
             continue
         code = _extract_code(card.get("all", ""))
@@ -617,6 +732,15 @@ def _fetch_current_code(
     # icloud-api.top 等"直接展示邮件"的卡片式页面：带发件人/主题/时间/正文，
     # 用专用解析器做 OTP 上下文 + 新鲜度校验，避免退回裸正则误取旧码/占位码。
     recognized, code = _extract_from_card_inbox(
+        response.text or "",
+        after_ts=after_ts,
+        exclude_codes=exclude_codes,
+    )
+    if recognized:
+        return code
+    # mail.ai1998.xyz 等 article.mail-card 式收件箱：多封邮件按时间倒序平铺，
+    # 必须逐卡片按 .date 做新鲜度筛选，否则裸正则会命中旧邮件里的旧验证码。
+    recognized, code = _extract_from_mail_card_inbox(
         response.text or "",
         after_ts=after_ts,
         exclude_codes=exclude_codes,

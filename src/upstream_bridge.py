@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -18,8 +20,9 @@ from dotenv import dotenv_values
 from .browser_bridge import BrowserBridgeTimeout, browser_bridge
 from .hero_sms import install_hero_sms_patch
 from .mailbox_store import MailboxStore
+from .notice_store import notices
 from .settings import Settings
-from .totp_auth import current_totp
+from .totp_auth import current_totp, normalize_totp_secret
 from .upstream_location import resolve_upstream_root
 
 
@@ -307,6 +310,22 @@ def _generic_api_otp_provider(mailbox: dict) -> tuple[Callable, Callable[[], Non
 
 
 _bridge_context = threading.local()
+# Browser-side waiting budgets, configured in 插件「调试」页 → 通用配置. Resolved
+# lazily because Settings is not available at import time here.
+_browser_config_store = None
+
+
+def _browser_config() -> dict:
+    global _browser_config_store
+    if _browser_config_store is None:
+        try:
+            from .browser_config_store import BrowserConfigStore
+            from .settings import load_settings
+
+            _browser_config_store = BrowserConfigStore(load_settings().data_dir)
+        except Exception:  # pragma: no cover - defensive: fall back to defaults
+            return {"page_load_timeout_ms": 45_000, "element_wait_timeout_ms": 30_000}
+    return _browser_config_store.get()
 
 
 def _current_bridge_tab() -> int | None:
@@ -338,6 +357,12 @@ def _bridge_request(
     target_tab = _current_bridge_tab()
     if target_tab is not None and "tab_id" not in payload:
         payload = {**payload, "tab_id": target_tab}
+    # Hand the browser its own waiting budget so a slow network (or a proxy in
+    # the middle) can be accommodated from the UI instead of by editing JS.
+    if kind in {"navigate", "reload"} and "page_load_timeout_ms" not in payload:
+        payload = {**payload, "page_load_timeout_ms": _browser_config()["page_load_timeout_ms"]}
+    elif kind == "page_action" and "element_wait_timeout_ms" not in payload:
+        payload = {**payload, "element_wait_timeout_ms": _browser_config()["element_wait_timeout_ms"]}
     try:
         result = browser_bridge.request(kind, payload, timeout=timeout)
     except BrowserBridgeTimeout as exc:
@@ -423,18 +448,47 @@ def _generate_about_you_profile() -> tuple[str, int]:
     return f"{first} {last}", age
 
 
-def _bridge_navigate(url: str, *, timeout: float = 90.0, retries: int = 2) -> dict:
+def _bridge_navigate(
+    url: str,
+    *,
+    timeout: float | None = None,
+    retries: int = 2,
+    ready_selector: str = "",
+    tolerate_timeout: bool = False,
+) -> dict:
     # A navigate that times out never completed, so re-issuing the same GET is
     # safe. Chrome MV3 service workers go idle and can miss the first request,
     # and the cold Cloudflare challenge on the first chatgpt.com/login load (esp.
     # right after a full cookie wipe) can exceed the tab-load window; a couple of
     # retries let a transient stall self-recover instead of killing the job.
+    #
+    # ``tolerate_timeout`` is for pages that may never report "load complete" at
+    # all — chatgpt.com holds connections open, so through a proxy the tab can
+    # sit in 'loading' indefinitely while the UI is perfectly usable. There the
+    # timeout says nothing about whether we can proceed, and the next step
+    # (which waits for its own controls) is the real arbiter.
+    if timeout is None:
+        from .browser_config_store import navigate_bridge_timeout_ms
+
+        # Always longer than the browser's own page-load budget — if both sides
+        # expired together the job would be orphaned (CLAUDE.md 踩坑 #2).
+        timeout = navigate_bridge_timeout_ms(_browser_config()) / 1000.0
     last_exc: RuntimeError | None = None
+    payload = {"url": url}
+    if ready_selector:
+        payload["ready_selector"] = ready_selector
     for attempt in range(retries + 1):
         try:
-            return _bridge_request("navigate", {"url": url}, timeout=timeout)
+            return _bridge_request("navigate", payload, timeout=timeout)
         except RuntimeError as exc:
-            if "超时" not in str(exc) or attempt >= retries:
+            if "超时" not in str(exc):
+                raise
+            if tolerate_timeout:
+                logging.getLogger(__name__).warning(
+                    "[Codex] 页面未报告加载完成（%s），但继续按页面控件推进：%s", url, exc
+                )
+                return {"ok": True, "url": url, "load_timeout": True}
+            if attempt >= retries:
                 raise
             last_exc = exc
             logging.getLogger(__name__).warning(
@@ -448,8 +502,30 @@ def _bridge_navigate(url: str, *, timeout: float = 90.0, retries: int = 2) -> di
     raise RuntimeError(f"浏览器桥导航失败：{url}")
 
 
+def _bridge_reload(*, timeout: float | None = None, ready_selector: str = "") -> dict:
+    """Reload the current tab (the scripted equivalent of pressing F5).
+
+    Needed when a page loaded fine but did not do what it was supposed to, so
+    re-injecting into it is pointless: the second request carries the cookies
+    the first response set.
+    """
+    if timeout is None:
+        from .browser_config_store import navigate_bridge_timeout_ms
+
+        timeout = navigate_bridge_timeout_ms(_browser_config()) / 1000.0
+    payload: dict = {}
+    if ready_selector:
+        payload["ready_selector"] = ready_selector
+    return _bridge_request("reload", payload, timeout=timeout)
+
+
 def _bridge_page_action(action: str, **payload) -> dict:
-    timeout = float(payload.pop("timeout", 120.0))
+    from .browser_config_store import page_action_bridge_timeout_ms
+
+    # Default derived from the configured element-wait budget so raising that in
+    # the UI never makes the browser outlive this request (orphaned job).
+    default_timeout = page_action_bridge_timeout_ms(_browser_config()) / 1000.0
+    timeout = float(payload.pop("timeout", default_timeout))
     raise_on_error = bool(payload.pop("raise_on_error", True))
     return _bridge_request(
         "page_action",
@@ -484,7 +560,74 @@ def _bridge_cleanup(*, timeout: float = 60.0) -> dict:
         return {"ok": False}
     if not result.get("ok"):
         logger.warning("[Codex] 账号开始前清理浏览器返回失败：%s", result.get("error") or "")
+        return result
+    # 清理是否真的生效，靠回执说话而不是假设：残留 cookie 正是 OpenAI 弹
+    # /choose-an-account（"Welcome back，上一个账号还在"）的直接原因。
+    remaining = int(result.get("remaining_cookies") or 0)
+    if remaining:
+        logger.warning(
+            "[Codex] 浏览器清理后仍残留 %d 个 cookie：%s（下一步很可能弹 /choose-an-account）",
+            remaining,
+            ", ".join(str(item) for item in (result.get("remaining_cookie_names") or []))[:300],
+        )
+    else:
+        logger.info(
+            "[Codex] 浏览器清理完成：cookie 已清空，顺带停用 %s 个仍停在目标站点的标签页",
+            result.get("parked_tabs") or 0,
+        )
     return result
+
+
+def _bridge_apply_proxy(mailbox: dict, *, label: str = "任务") -> None:
+    """Point the browser at this account's proxy before it loads anything.
+
+    ``mailbox['proxy']`` is filled by the scheduler's round-robin over the pool;
+    absent means "no proxy for this account", which still has to be sent so the
+    browser drops a proxy left over from the previous account. Failure is logged
+    but never fatal — losing the proxy must not kill an otherwise fine job.
+    """
+    logger = logging.getLogger(__name__)
+    proxy = mailbox.get("proxy") if isinstance(mailbox.get("proxy"), dict) else None
+    try:
+        result = _bridge_request(
+            "proxy_apply", {"proxy": proxy}, timeout=30.0, raise_on_error=False
+        )
+    except RuntimeError as exc:
+        logger.warning("[Codex] %s：设置浏览器代理失败：%s", label, exc)
+        return
+    if not result.get("ok"):
+        logger.warning("[Codex] %s：设置浏览器代理返回失败：%s", label, result.get("error") or "")
+        return
+    if proxy:
+        logger.info(
+            "[Codex] %s：浏览器代理已切换到 %s（%s://%s:%s）",
+            label,
+            proxy.get("label") or proxy.get("id") or "",
+            proxy.get("scheme"),
+            proxy.get("host"),
+            proxy.get("port"),
+        )
+        # The timezone/language the browser reports is no longer derived from
+        # this proxy — it is whatever the operator pinned in 调试 → 指纹. Log it
+        # next to the proxy anyway: a clock that contradicts the exit IP is a
+        # stronger "proxy" tell than the IP itself.
+        if result.get("fingerprint_enabled"):
+            logger.info(
+                "[Codex] %s：浏览器指纹（用户指定）：时区 %s · 语言 %s",
+                label,
+                result.get("fingerprint_timezone") or "",
+                result.get("fingerprint_language") or "",
+            )
+        else:
+            logger.warning(
+                "[Codex] %s：未启用指纹覆盖，浏览器仍报本机时区/语言（代理测出的时区为 %s），风控可能据此识别代理",
+                label,
+                result.get("proxy_timezone") or "未知",
+            )
+        if result.get("warning"):
+            logger.warning("[Codex] %s：%s", label, result.get("warning"))
+    else:
+        logger.info("[Codex] %s：未分配代理，浏览器已恢复直连", label)
 
 
 def _bridge_page_fetch(url: str, *, timeout: float = 60.0) -> dict:
@@ -681,9 +824,13 @@ def _submit_login_step(action: str, *, label: str, step: str, logger, **payload)
     could report back). Failing outright here would throw away a good login;
     instead defer to ``_confirm_logged_in``, which reads the session endpoint and
     is the single source of truth. If the login really didn't happen it just
-    fails there after genuinely checking, so this never fabricates success."""
+    fails there after genuinely checking, so this never fabricates success.
+
+    "可信点击落空"（目标被瞬时遮挡 / 元素刚挪走）同样不是失败：那一下点击**根本
+    没派发出去**（SW 派发前会重新量坐标并确认目标就在那个点上），所以整步重跑不会
+    重复提交，只是等页面稳定再来一次。"""
     try:
-        return _bridge_page_action(action, **payload)
+        return _page_action_with_click_retry(action, logger, label=label, step=step, **payload)
     except RuntimeError as exc:
         teardown = _is_frame_teardown_error(exc)
         bridge_timeout = "浏览器桥接超时" in str(exc)
@@ -706,6 +853,674 @@ def _submit_login_step(action: str, *, label: str, step: str, logger, **payload)
         return {"ok": True, "frame_teardown": True, "error_text": "", "teardown_error": str(exc)}
 
 
+_LOGIN_WITH_URL = "https://chatgpt.com/auth/login_with?callback_path=/"
+# The extension raises this token when chatgpt.com served the logged-out SPA
+# shell instead of redirecting to auth.openai.com.
+_LOGIN_WITH_SHELL_TOKEN = "login_with_shell"
+# The login page sometimes defaults to the phone-number form, which has no email
+# box at all — the flow then waits out its whole budget and fails on "未找到邮箱
+# 输入框". ?usernameKind=email pins it to email entry.
+_OPENAI_LOGIN_URL = "https://auth.openai.com/log-in?usernameKind=email"
+# Entry points to the email form, tried in order.
+#   1. auth.openai.com/log-in — the login page itself, and by far the lightest.
+#      After a cookie wipe it may be the "会话已结束" interstitial whose only
+#      control is a 登录 link, but submit_email just clicks that.
+#   2. chatgpt.com root — its 登录 button reaches the same place.
+#   3. chatgpt.com/auth/login_with — the old primary. Kept only as a last
+#      resort: it is a heavy SPA route that fairly often renders the logged-out
+#      chat landing page instead of redirecting, which wastes a whole attempt.
+# Each entry is a *different HTTP request*, which is the only thing that can fix
+# a page that loaded fine but refused to redirect. Retrying the same URL cannot.
+_LOGIN_ENTRY_URLS = (
+    _OPENAI_LOGIN_URL,
+    "https://chatgpt.com/",
+    _LOGIN_WITH_URL,
+)
+# With a proxy in play, only chatgpt.com works: the auth.openai.com entries end
+# up bounced back to "你的会话已结束", and everything funnels through this page
+# anyway. Trying the others first just burns a full attempt each.
+# The route from here is: click the top-right "Log in" → the "Log in or sign up"
+# dialog opens on PHONE entry → click "Continue with email" → email box.
+_PROXY_LOGIN_ENTRY_URLS = ("https://chatgpt.com/",)
+# 注册入口 —— 和登录入口是两回事，绝不能混用。
+# /log-in 是**登录**页：往里填一个全新地址，OpenAI 会回「Enter your password」
+# （/log-in/password），流程直接死在那里，还很容易被误读成"这个号已经注册过了"。
+# 注册必须走 /create-account，它才会给出 /email-verification 验证码页，
+# 再由「Continue with password」进 /create-account/password 设密码。
+_SIGNUP_ENTRY_URLS = (
+    "https://chatgpt.com/",
+    "https://auth.openai.com/create-account",
+)
+# **为什么首页排在 /create-account 前面（2026-08-12 直连实测）**：
+# logs/codex-7c4f2e28fe801a14090542d3-5bf08f2d-a1.log、codex-457624dc85202443bf8e3568：
+# 无代理、清完 cookie 后 GET /create-account，**连续 5 轮全是 `Your session has ended`**
+# （`is_missing_session:true`，整页只有一个 Log in 链接、没有任何输入框），每轮都先经
+# chatgpt.com 重新种会话，**一次都没生效**；换 `chatgpt.com/auth/login_with?screen_hint=
+# signup` 又被重定向回同一张中转页，再废 5 轮，整单失败还白烧一个取号。
+# 同一批日志里代理跑的 codex-0c253ac577af3bc3447052b9 从 chatgpt.com 首页进弹窗，
+# 一路 otp → 设密码 → about-you 注册成功。所以"预热能把 /create-account 的会话种起来"
+# 这个前提已经不成立了，直连和代理一样只能从首页进；/create-account 只留作后备
+# （会话真的建起来时它是直达的，登录页上的 Sign up 链接 href 就是它）。
+# `?screen_hint=signup` 那个入口已删除：它落到的就是同一张中转页，纯属白等。
+# **代理模式下的注册入口**：只走 chatgpt.com 首页，点右上角「Log in」进那个
+# 「Log in or sign up」弹窗 →「Continue with email」→ 输邮箱，后面照旧。
+# 代理下**连后备都不给** auth.openai.com/create-account：
+# 依据（logs/codex-a87e3d33c1101746f29f9537-6782ed72-a1.log，jp 住宅代理）：
+# `auth.openai.com/create-account` 连续 5 轮全部渲染成 `Your session has ended`
+# （每轮都先经 chatgpt.com 重新种会话，无效）；第 6 轮好不容易过去，提交邮箱直接
+# 落 `login-password`，点「Sign up」回到 create-account 再提交还是 `login-password`，
+# 第三次变 `unknown` 收工。也就是说走代理时 auth.openai.com 这个入口拿不到注册表单，
+# 再怎么重发都是白烧一个取号。chatgpt.com 那个弹窗本身就叫 **"Log in or sign up"**，
+# 是同一套 identifier-first 流程，新地址会走到 /email-verification。
+# 注意：这跟"注册入口和登录入口不能混用"（上面 _SIGNUP_ENTRY_URLS 的告诫）不冲突——
+# 被禁的是 `auth.openai.com/log-in` 那个**纯登录**页，以及"会话已结束"中转页上那条
+# 把注册拖进登录的 Log in 链接；chatgpt.com 首页的 Log in 按钮进的是二合一弹窗。
+_PROXY_SIGNUP_ENTRY_URLS = ("https://chatgpt.com/",)
+# 入口是 chatgpt.com 首页时，页面上一开始**没有任何输入框**（要先点 Log in 才有），
+# 所以就绪判据、预热、以及"会话中转页"的恢复方式都要按登录那套来，不能按注册那套。
+_CHATGPT_HOME_RE = re.compile(r"^https?://(www\.)?chatgpt\.com/?(\?.*)?$", re.I)
+# 非首页的注册入口落在"会话已结束"中转页时，最多重新种几次会话就换下一个入口。
+# 实测种会话对 /create-account 已经完全无效（见 _SIGNUP_ENTRY_URLS 的日志），
+# 原来的 6 轮 × 两个入口 = 白等 90s 才失败；留 2 轮只是给偶发情况一个机会。
+_SIGNUP_RESEED_ROUNDS = 2
+
+
+def _signup_entry_urls(mailbox: dict) -> tuple[str, ...]:
+    """注册入口阶梯：一律先走 chatgpt.com 首页，代理下只走它。"""
+
+    if isinstance(mailbox.get("proxy"), dict):
+        return _PROXY_SIGNUP_ENTRY_URLS
+    return _SIGNUP_ENTRY_URLS
+
+
+# 注册导航的"就绪"判据只认**真正的输入框**，绝不认登录链接。
+# _LOGIN_READY_SELECTOR 里有 `a[href*="/log-in"]`，而"会话已结束"中转页上那个
+# 「Log in」链接正好匹配——导航一看到它就返回，于是每一轮都在中转页上白跑一次
+# submit_email，实测要 4~5 轮才碰上真表单（每轮 3~7s）。只等输入框的话，导航会
+# 一直等到表单真的画出来（或超时后由重试逻辑换一次请求）。
+_SIGNUP_READY_SELECTOR = (
+    'input[type="email"], input[autocomplete="username"], input[name="username"],'
+    ' input[name="email"], input[id*="email" i], input[type="password"]'
+)
+# 预热导航的预算。它只为拿一次 HTTP 往返（种 cookie），不需要页面渲染完；
+# 用完整的页面加载预算会在慢代理下白等满，实测预热+入口一共烧掉 120s。
+_SIGNUP_WARMUP_TIMEOUT = 20.0
+# Navigation stops waiting the moment one of these exists, instead of waiting for
+# the whole page to finish loading — the email box, or any control that leads to
+# it, is all the next step needs. chatgpt.com never reliably reports "complete"
+# behind a proxy, so this is what keeps the flow moving.
+_LOGIN_READY_SELECTOR = (
+    'input[type="email"], input[autocomplete="username"], input[name="username"],'
+    ' input[name="email"], input[id*="email" i], input[type="password"],'
+    ' input[type="tel"],'
+    ' a[href*="/auth/login_with"], a[href*="/log-in"],'
+    ' [data-testid*="login" i], [data-testid*="signup" i]'
+)
+# The extension raises this when the page still shows a clickable 登录 control
+# but no email form — i.e. we bounced back to "你的会话已结束". Re-running
+# submit_email clicks it again, which is how a human gets through.
+_LOGIN_RETRY_CLICK_TOKEN = "login_retry_click"
+# How many times one entry may click its way forward before we try another URL.
+# Each click is a fresh request that carries more session context, and the
+# interstitial can legitimately appear more than once in a row.
+_LOGIN_CLICK_ROUNDS = 6
+# How long to let a proxied login page settle before touching it. Cloudflare's
+# JS detection and OpenAI's sentinel iframe score the visit in the background;
+# acting faster than they finish is what gets the session thrown away.
+_PROXY_SETTLE_SECONDS = 3.0
+# Errors that mean "this entry is a dead end, try the next one" rather than
+# "this account/page is broken".
+# 注意 `未找到邮箱输入框` 有个例外：页面可能是**已经走过邮箱这一步**才没有邮箱框，
+# 那就绝不能重进入口（会把进度扔掉）。见下面 _NO_EMAIL_BOX_TOKEN 的处理。
+_NO_EMAIL_BOX_TOKEN = "未找到邮箱输入框"
+_LOGIN_ENTRY_DEAD_END = (_LOGIN_WITH_SHELL_TOKEN, _NO_EMAIL_BOX_TOKEN)
+# 提交邮箱后被 OpenAI 直接甩去第三方身份提供商（实测 accounts.google.com）。
+# 这是风控动作，不是我们点错了按钮：救不回来，也不该重试——重试只会再烧一个取号。
+_RISK_BLOCK_TOKEN = "openai_risk_block"
+_THIRD_PARTY_IDP_RE = re.compile(
+    r"^https?://([^/]*\.)?(accounts\.google\.com|login\.microsoftonline\.com|appleid\.apple\.com"
+    r"|facebook\.com|github\.com/login)",
+    re.I,
+)
+
+
+def _risk_block_failure(url: str) -> RuntimeError:
+    return RuntimeError(
+        f"[Codex] {_RISK_BLOCK_TOKEN}：提交邮箱后被 OpenAI 甩到第三方登录页"
+        f"（{str(url)[:120]}），这是风控拦截、救不回来，放弃该账号"
+    )
+
+
+def _third_party_idp_url() -> str:
+    """当前标签页是不是已经被甩到第三方身份提供商了（不注入，纯读 URL）。"""
+
+    result = _bridge_request("tab_url", {}, timeout=20.0, raise_on_error=False)
+    url = str(result.get("url") or "")
+    return url if _THIRD_PARTY_IDP_RE.match(url) else ""
+
+
+def _wait_for_post_email_landing(logger, label: str, *, timeout: float = 25.0) -> str:
+    """Watch the tab's own URL after the email was submitted.
+
+    The in-page judgement runs inside one document and closes its window after a
+    fixed budget. Through a slow proxy the navigation to /email-verification can
+    land *after* that — the OTP really was sent, but the step reported "unknown"
+    and the run was killed. Polling the tab URL costs nothing, needs no
+    injection, and is immune to the page's language (which the locale override
+    can change out from under every text-based check).
+    """
+    # Counted rather than wall-clock: the loop's pace IS the sleep, so counting
+    # keeps it honest when sleeping is cheap (and keeps tests instant).
+    interval = 1.0
+    for _ in range(max(1, int(max(1.0, timeout) / interval))):
+        result = _bridge_request("tab_url", {}, timeout=20.0, raise_on_error=False)
+        url = str(result.get("url") or "").lower()
+        # 风控甩去第三方登录页：立刻收手，别再等它变回来。
+        if _THIRD_PARTY_IDP_RE.match(url):
+            raise _risk_block_failure(url)
+        if "/email-verification" in url:
+            logger.info("[Codex] %s：页面随后跳到了 %s，验证码已发出，继续等取码", label, url[:120])
+            return "otp"
+        if "/create-account/password" in url:
+            return "create-account-password"
+        if "/phone-verification" in url or "/add-phone" in url:
+            return "phone"
+        time.sleep(interval)
+    return ""
+
+
+# 点「Continue with password」之后可能的两个落点。**必须区分**：
+# /create-account/password 是注册设密码页（我们要的），/log-in/password 是登录页
+# ——把自己生成的密码填进去等于拿它当已有账号的登录密码（踩坑 #17）。
+_PASSWORD_PAGE_URLS = (
+    ("/create-account/password", "create-account-password"),
+    ("/log-in/password", "login-password"),
+)
+# 导航落地之后、注入下一步之前的静置窗口。URL 变了不等于页面能点了：新页面还在
+# 做视图过渡时，点击会被判成"目标点被其它元素遮挡"。
+_PAGE_TRANSITION_SETTLE_SECONDS = 1.2
+# 扩展侧 trustedClick 报"点击落空"时用的关键词。它是瞬时状态（过渡层、回流），
+# 扩展自己已经重试过；Python 侧再给一次整步重跑，别为它作废一个账号。
+_CLICK_MISSED_TOKEN = "可信点击落空"
+# 提交注册密码之后的落点。正常是 /email-verification（OpenAI 这时才发验证码）。
+# 只列"已经往前走了"的页面：还停在 /create-account/password 就继续等，绝不能把
+# "还没跳"当成落点。
+_POST_SIGNUP_PASSWORD_URLS = (
+    ("/email-verification", "otp"),
+    ("/phone-verification", "phone"),
+    ("/add-phone", "phone"),
+    ("/about-you", "about-you"),
+)
+
+
+def _wait_for_tab_stage(
+    logger, label: str, *, targets, timeout: float = 25.0, step: str = "", settle: float | None = None
+) -> str:
+    """轮询**标签页自身的 URL**，直到落到 ``targets`` 里的某个片段。
+
+    只读 URL：不注入、不受页面语言影响（同踩坑 #12），也不会被"页面已经被销毁的
+    那个 document"骗到。``targets`` 只列"已经往前走了"的页面，所以页面还没跳时会
+    继续等，而不是把原地当落点。
+
+    ``settle``：**URL 变了不等于页面能点了**。这些调用点后面紧跟着一次注入操作，
+    而新页面此时可能还在做视图过渡（旧视图淡出层压在新视图上）、字体回流。实测
+    logs/codex-2ffe475cee4fb8bb73aa7c70-1d27c48f：URL 一到 /create-account/password
+    就立刻去填密码，点击被判"目标点被其它元素遮挡"，整单作废；隔 3 分钟手动重跑
+    同一个账号一次就过。所以匹配到之后统一静置一小会儿再返回。
+    """
+
+    interval = 1.0
+    for _ in range(max(1, int(max(1.0, timeout) / interval))):
+        result = _bridge_request("tab_url", {}, timeout=20.0, raise_on_error=False)
+        url = str(result.get("url") or "").lower()
+        if _THIRD_PARTY_IDP_RE.match(url):
+            raise _risk_block_failure(url)
+        for needle, stage in targets:
+            if needle in url:
+                logger.info("[Codex] %s：%s页面已到 %s", label, f"{step}后" if step else "", url[:120])
+                time.sleep(_PAGE_TRANSITION_SETTLE_SECONDS if settle is None else max(0.0, settle))
+                return stage
+        time.sleep(interval)
+    return ""
+
+
+def _wait_for_password_page(logger, label: str, *, timeout: float = 25.0) -> str:
+    """点「Continue with password」之后，靠标签页自身的 URL 判落点。
+
+    这一步的点击本来就会把页面带到 /create-account/password，注入帧随之销毁——
+    `Frame with ID 0 was removed` 是**点成功了**的表现，不是失败。
+
+    刻意**不复用扩展的 inspectAuthFlowStage**：它把 /log-in/password 也算成
+    create-account-password，正是踩坑 #17 那个把生成密码填进登录框的误判。
+    """
+
+    return _wait_for_tab_stage(logger, label, targets=_PASSWORD_PAGE_URLS, timeout=timeout)
+
+
+def _page_action_with_click_retry(action: str, logger, *, label: str, step: str, attempts: int = 3, **payload) -> dict:
+    """跑一个 page_action；只在"可信点击落空"时整步重跑。
+
+    落空 = 那一下点击**根本没派发出去**（SW 派发前重新量坐标、确认目标就在那个点上，
+    不是就不点），所以重跑不会产生重复提交。它的成因都是瞬时的：新页面还在做视图
+    过渡、字体回流、弹层正在收起。实测同一个账号第一遍死在这里、隔几分钟重跑一次
+    就过（logs/codex-2ffe475cee4fb8bb73aa7c70-1d27c48f vs -cbd917a5）——那种"重跑就
+    好"的失败不该由用户来做。
+    """
+
+    last: RuntimeError | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return _bridge_page_action(action, **payload)
+        except RuntimeError as exc:
+            if _CLICK_MISSED_TOKEN not in str(exc):
+                raise
+            last = exc
+            if attempt >= attempts:
+                break
+            logger.warning(
+                "[Codex] %s：%s时点击落空（第 %d/%d 次），等页面稳定后重试：%s",
+                label,
+                step,
+                attempt,
+                attempts,
+                str(exc)[:160],
+            )
+            time.sleep(_PAGE_TRANSITION_SETTLE_SECONDS * attempt)
+    raise last if last is not None else RuntimeError(f"[Codex] {label}：{step}失败")
+
+
+def _submit_signup_password(logger, *, label: str, password: str) -> dict:
+    """提交注册密码。提交成功**本来就会**跳到 /email-verification 并销毁注入帧。
+
+    帧销毁有两种表现（踩坑 #1）：抛 `Frame with ID X was removed`，**或 executeScript
+    静默返回 null → "页面动作返回空结果"**。两种 `_is_frame_teardown_error` 都认，
+    但这一步以前是裸调用，没人接——于是密码明明设好了、页面已经在验证码页上，任务
+    却在这里判死，连 120s 的取码都没等（实测
+    logs/codex-d230681a1023b30343738ede-1e3b489f-a1.log）。
+    """
+
+    try:
+        return _page_action_with_click_retry(
+            "submit_signup_password", logger, label=label, step="设置账号密码", password=password
+        )
+    except RuntimeError as exc:
+        if not _is_frame_teardown_error(exc) and "浏览器桥接超时" not in str(exc):
+            raise
+        logger.info(
+            "[Codex] %s：提交密码后注入帧被销毁（页面正在跳转），改读标签页 URL 判落点：%s",
+            label,
+            str(exc)[:160],
+        )
+        stage = _wait_for_tab_stage(
+            logger, label, targets=_POST_SIGNUP_PASSWORD_URLS, timeout=30.0, step="提交密码"
+        )
+        if stage:
+            return {"ok": True, "next_stage": stage, "frame_teardown": True}
+        raise _register_failure(
+            "提交注册密码后页面发生跳转，但没有落到验证码页"
+        ) from exc
+
+
+# 用"已经存在的密码"登录之后的落点。填对密码后 OpenAI 会要求邮箱验证。
+_POST_KNOWN_PASSWORD_URLS = (
+    ("/email-verification", "otp"),
+    ("/phone-verification", "phone"),
+    ("/add-phone", "phone"),
+    ("/about-you", "about-you"),
+)
+
+
+def _resume_with_known_password(logger, *, label: str, email: str, password: str) -> str:
+    """重跑的账号：上一轮已经建号并设过密码，把**存下来的那个密码**填回登录页。
+
+    OpenAI 记得这个账号的密码，所以此时的 `/log-in/password` 不是死路——填对之后它
+    会要求邮箱验证（`/email-verification`），正好接回原本的取码流程。判死刑等于白扔
+    一个已经建好的账号，还白烧一个取号。
+
+    **注意这里要的正是 `/log-in/password`**：账号是我们自己建的、密码在手上，和
+    "注册阶段绝不能走登录密码页"（踩坑 #17/#20）是相反的诉求——那两条针对的是
+    **没有密码**的全新地址。所以这条路只在 `known_password` 非空时才走。
+
+    返回落点阶段；`otp` 表示已经在验证码页上了。
+    """
+
+    logger.info("[Codex] %s：该地址上一轮已建号并设过密码，直接用已存密码登录", label)
+    notices.push("该账号上一轮已建号，正在用已保存的密码登录…", scope="signup")
+    result = _submit_login_step(
+        "submit_password", label=label, step="提交已存密码", logger=logger, password=password
+    )
+    error = str(result.get("error_text") or "").strip()
+    if error and re.search(r"incorrect email address or password|邮箱地址或密码不正确", error, re.I):
+        # 密码对不上：这个地址确实已被注册，但不是被我们注册的（或密码被改过）。
+        raise _account_exists_failure(email, "已存密码被 OpenAI 判为不正确")
+    # 落点一律以标签页 URL 为准：不注入、不受页面语言影响，也不会被销毁的旧 document 骗到。
+    stage = _wait_for_tab_stage(
+        logger, label, targets=_POST_KNOWN_PASSWORD_URLS, timeout=30.0, step="提交已存密码"
+    )
+    if not stage:
+        if error:
+            raise _register_failure(f"用已存密码登录失败：{error[:200]}")
+        raise _register_failure("用已存密码登录后没有落到验证码页")
+    return stage
+
+
+def _switch_to_password_signup(logger, *, label: str) -> str:
+    """点验证码页底部的「Continue with password」，返回落点阶段。
+
+    点击会导航，导航会销毁注入帧——所以帧销毁/桥接超时**一律不能当失败**：那样会
+    把一个已经发出验证码的账号直接作废，还白烧一个取号（实测
+    logs/codex-d230681a1023b30343738ede-35828900-a1.log：页面明明已经到了
+    /create-account/password，却报 `Frame with ID 0 was removed.` 收工）。
+    """
+
+    try:
+        switch = _page_action_with_click_retry(
+            "continue_with_password", logger, label=label, step="切换到密码注册"
+        )
+    except RuntimeError as exc:
+        if not _is_frame_teardown_error(exc) and "浏览器桥接超时" not in str(exc):
+            raise
+        logger.info(
+            "[Codex] %s：点「Continue with password」后注入帧被销毁（页面正在跳转），改读标签页 URL 判落点：%s",
+            label,
+            str(exc)[:160],
+        )
+        stage = _wait_for_password_page(logger, label=label)
+        if stage:
+            return stage
+        raise _register_failure(
+            "点「Continue with password」后页面发生跳转，但没有落到密码设置页"
+        ) from exc
+    if switch.get("password_switch_missing"):
+        raise _register_failure(
+            "验证码页没有「Continue with password」入口，无法设置密码，放弃该账号"
+        )
+    if str(switch.get("error_text") or "").strip():
+        raise _register_failure(f"切换密码注册失败：{str(switch.get('error_text'))[:200]}")
+    stage = str(switch.get("next_stage") or "").strip().lower()
+    if not stage:
+        # 页内判据没认出来：慢代理下导航可能晚于判据窗口。再用 URL 兜一次。
+        stage = _wait_for_password_page(logger, label=label)
+    return stage
+
+
+def _open_login_and_submit_email(
+    settings: Settings,
+    mailbox: dict,
+    *,
+    email: str,
+    logger,
+    label: str,
+    entry_urls: tuple[str, ...] | None = None,
+    signup: bool = False,
+) -> str:
+    """Clean the browser, walk the entry ladder, submit the address.
+
+    Returns the stage the page landed on (``otp`` / ``password`` /
+    ``create-account-password`` …). Shared by 登录 (existing accounts) and 注册
+    (fresh smsbower addresses) because both need exactly this preamble, and it
+    carries every hard-won workaround: the "你的会话已结束" interstitial, frame
+    teardown mid-redirect, dead-end entries, and the tab-URL fallback that keeps
+    a slow proxy from throwing away an OTP that really was sent.
+
+    ``entry_urls`` MUST be the signup ladder for 注册: /log-in is the LOGIN page,
+    and typing a fresh address there gets answered with "enter your password"
+    instead of the signup verification code. See _SIGNUP_ENTRY_URLS.
+
+    ``signup`` additionally forbids following the "你的会话已结束" page's 登录
+    link — that link is a one-way door into the LOGIN flow.
+    """
+    logger.info("[Codex] %s：账号开始前清理浏览器（保持隐私模式）", label)
+    if signup:
+        notices.push("正在清理浏览器环境…", scope="signup")
+    proxied = isinstance(mailbox.get("proxy"), dict)
+    _bridge_apply_proxy(mailbox, label=label)
+    _bridge_cleanup()
+    # Walk the entry ladder (see _LOGIN_ENTRY_URLS): each entry gets one plain
+    # reload before moving on, because a page that loaded but did not redirect
+    # can only be fixed by a new request — and if the same URL fails twice, a
+    # different entry is far more likely to help than a third identical try.
+    email_result = None
+    last_error = ""
+    if entry_urls is None:
+        entry_urls = _PROXY_LOGIN_ENTRY_URLS if proxied else _LOGIN_ENTRY_URLS
+    # 注册只认真正的输入框；登录还要认「登录」链接（中转页本来就是靠点它过去的）。
+    # 例外：注册入口是 chatgpt.com 首页时，那页一开始压根没有输入框（要先点右上角
+    # 「Log in」才有），只等输入框就会白等满整个导航预算，所以按登录那套判据来。
+    entry_via_chatgpt_home = tuple(bool(_CHATGPT_HOME_RE.match(url)) for url in entry_urls)
+    ready_selector = _SIGNUP_READY_SELECTOR if signup else _LOGIN_READY_SELECTOR
+    if signup and not any(entry_via_chatgpt_home):
+        # auth.openai.com 的会话要靠一次经 chatgpt.com 的 OAuth 往返才建立得起来。
+        # 清完 cookie 后直接 GET /create-account 跳过了这一步，OpenAI 只会回
+        # is_missing_session 中转页——实测得盲目重发 4~5 次才碰上真表单，每次 3~11s。
+        # 中转页自己就写着出路（"Continue by logging in" → chatgpt.com/auth/login_with），
+        # 那条链接的作用正是种会话；而会话建成后 /create-account 是可直达的
+        # （登录页上的 "Sign up" 链接 href 就是 /create-account）。
+        # 所以先走一次 chatgpt.com 把会话种下——**只导航，不在那页做任何操作**，
+        # 免得又被拖进登录流程——再进注册入口。
+        logger.info("[Codex] %s：先经 chatgpt.com 建立 auth 会话，再进注册入口", label)
+        notices.push("正在建立 OpenAI 会话…", scope="signup")
+        try:
+            _bridge_navigate(
+                _LOGIN_WITH_URL,
+                ready_selector=_LOGIN_READY_SELECTOR,
+                retries=0,
+                tolerate_timeout=True,
+                # 预热只要一次 HTTP 往返把 cookie 种下，不需要页面渲染完。给足
+                # 45s 的完整导航预算在慢代理下会白等满——实测预热+入口两次导航
+                # 一共烧掉 120s。这里给一个短预算，超时就直接往下走。
+                timeout=_SIGNUP_WARMUP_TIMEOUT,
+            )
+        except RuntimeError as exc:
+            # 种会话失败不致命：下面的入口阶梯本来就有重试兜底。
+            logger.warning("[Codex] %s：预热会话失败，直接试注册入口：%s", label, str(exc)[:160])
+        if proxied:
+            time.sleep(_PROXY_SETTLE_SECONDS)
+    for entry_index, entry_url in enumerate(entry_urls):
+        if entry_index:
+            logger.warning("[Codex] %s：换用入口 %s", label, entry_url)
+        # chatgpt.com 首页作为注册入口时，"就绪"只能按登录那套判（见上）。
+        via_chatgpt_home = entry_via_chatgpt_home[entry_index]
+        entry_ready_selector = _LOGIN_READY_SELECTOR if via_chatgpt_home else ready_selector
+        if signup and via_chatgpt_home:
+            logger.info(
+                "[Codex] %s：从 chatgpt.com 首页进入并点右上角「Log in」提交邮箱", label
+            )
+        _bridge_navigate(
+            entry_url,
+            # Stop waiting as soon as something clickable exists. chatgpt.com is
+            # a long-polling SPA: behind a proxy the tab can stay in 'loading'
+            # essentially forever while the header (with its Log in button) is
+            # already usable, which produced an endless "标签页加载超时" retry
+            # loop. submit_email does its own waiting and clicking, so it — not
+            # the load event — decides when the page is ready.
+            ready_selector=entry_ready_selector,
+            retries=0 if proxied else 2,
+            tolerate_timeout=True,
+        )
+        if proxied:
+            # Still give Cloudflare's JS detection and the sentinel iframe a
+            # moment before touching anything.
+            time.sleep(_PROXY_SETTLE_SECONDS)
+        reloaded_this_entry = False
+        reseed_rounds = 0
+        # No fixed sleep here: the navigate above already returned because the
+        # email box (or the 登录 control) is on screen, and submit_email waits
+        # for it again anyway. A blanket sleep was pure dead time per account.
+        for entry_attempt in range(1, _LOGIN_CLICK_ROUNDS + 1):
+            try:
+                if signup:
+                    notices.push(f"正在提交邮箱 {email}…", scope="signup")
+                email_result = _bridge_page_action("submit_email", email=email)
+                break
+            except RuntimeError as exc:
+                msg = str(exc)
+                last_error = msg
+                if _RISK_BLOCK_TOKEN in msg:
+                    raise
+                # 风控甩去 accounts.google.com 是跨域跳转，会把注入帧一起销毁，
+                # 于是报上来的是"帧销毁"——正好落进下面的可重试分支，白白再试 6 轮。
+                # 只在这一种情况下多读一次标签页 URL：其它错误页面还在 OpenAI 域内，
+                # 没必要为此给每次重试都加一个桥接往返（登录路径的调用序列也有断言）。
+                if signup and _is_frame_teardown_error(msg):
+                    blocked_url = _third_party_idp_url()
+                    if blocked_url:
+                        raise _risk_block_failure(blocked_url) from exc
+                # Still on "你的会话已结束" with a 登录 control, or the click we just
+                # made tore the frame down mid-navigation. Both mean "we are
+                # making progress, run the step again" — it starts by clicking.
+                click_again = _LOGIN_RETRY_CLICK_TOKEN in msg or _is_frame_teardown_error(msg)
+                dead_end = any(token in msg for token in _LOGIN_ENTRY_DEAD_END)
+                timed_out = bool(re.search(r"标签页加载超时|超时", msg))
+                if _NO_EMAIL_BOX_TOKEN in msg:
+                    # "没有邮箱框"不等于"这个入口是死路"——页面很可能**已经走过
+                    # 邮箱这一步了**。实测：点回中转页的登录控件后 OpenAI 直接把我们
+                    # 送回 /email-verification（Check your inbox +「Continue with
+                    # password」），那页当然没有邮箱框；旧代码把它当死路重新加载入口，
+                    # 等于把已经拿到的进度扔掉，还白烧一个取号。
+                    # 只读标签页 URL：不注入、不受页面语言影响（同踩坑 #12）。
+                    landed = _wait_for_post_email_landing(logger, label, timeout=3.0)
+                    if landed:
+                        logger.info(
+                            "[Codex] %s：页面其实已经走过邮箱步骤（阶段 %s），不再重进入口",
+                            label,
+                            landed,
+                        )
+                        email_result = {"next_stage": landed}
+                        break
+                if not (click_again or dead_end or timed_out):
+                    raise
+                if entry_attempt >= _LOGIN_CLICK_ROUNDS:
+                    break
+                if click_again:
+                    if signup and not via_chatgpt_home:
+                        # 注册模式绝不能跟着「Log in」走：清完 cookie 后
+                        # /create-account 会先渲染成"你的会话已结束"，而那页唯一的
+                        # 控件是 Log in → chatgpt.com/auth/login_with，点下去整条
+                        # 流程就从"注册"被拖进"登录"，后面拿到的是登录版
+                        # /email-verification，它的「Continue with password」去的是
+                        # /log-in/password 而不是 /create-account/password。
+                        #
+                        # 但也别对同一个地址盲发：中转页说明会话还没建起来，重发
+                        # 只是碰运气（实测要 4~5 次）。经 chatgpt.com 再种一次会话，
+                        # 然后才回注册入口——只导航、不点它页面上的任何东西。
+                        #
+                        # 入口本来就是 chatgpt.com 首页时**不走这套**：那里的
+                        # 「Log in」进的是二合一弹窗（Log in or sign up），点它正是
+                        # 我们要的动作；这时 login_retry_click 多半来自弹窗默认的
+                        # 手机号表单，重跑 submit_email（它开头就会点
+                        # 「Continue with email」）才是对的恢复方式。
+                        logger.info(
+                            "[Codex] %s：注册入口仍是会话中转页，经 chatgpt.com 重新种会话后再进 %s",
+                            label,
+                            entry_url,
+                        )
+                        reseed_rounds += 1
+                        if reseed_rounds > _SIGNUP_RESEED_ROUNDS:
+                            # 种会话对这个入口无效（实测 /create-account 已经彻底
+                            # 拿不到注册表单），继续重发只是每轮白等 4~11s。
+                            logger.warning(
+                                "[Codex] %s：入口 %s 连续 %d 轮都停在会话中转页，换下一个入口",
+                                label,
+                                entry_url,
+                                reseed_rounds,
+                            )
+                            break
+                        try:
+                            _bridge_navigate(
+                                _LOGIN_WITH_URL,
+                                ready_selector=_LOGIN_READY_SELECTOR,
+                                retries=0,
+                                tolerate_timeout=True,
+                            )
+                        except RuntimeError as warm_exc:
+                            logger.warning(
+                                "[Codex] %s：重新种会话失败：%s", label, str(warm_exc)[:160]
+                            )
+                        _bridge_navigate(
+                            entry_url,
+                            ready_selector=entry_ready_selector,
+                            retries=0 if proxied else 1,
+                            tolerate_timeout=True,
+                        )
+                        continue
+                    logger.info(
+                        "[Codex] %s：页面还停在登录中转页，再点一次登录重新进入流程（第 %d 次）：%s",
+                        label,
+                        entry_attempt + 1,
+                        msg[:200],
+                    )
+                    continue
+                if dead_end:
+                    if reloaded_this_entry:
+                        # Reloading this URL already failed once; a different
+                        # entry is far more likely to help than a third try.
+                        break
+                    reloaded_this_entry = True
+                    logger.warning(
+                        "[Codex] %s：入口 %s 未落到邮箱表单，重新加载后再试一次",
+                        label,
+                        entry_url,
+                    )
+                    try:
+                        _bridge_reload(ready_selector=entry_ready_selector)
+                    except RuntimeError as reload_exc:
+                        logger.warning("[Codex] %s：重新加载失败：%s", label, str(reload_exc)[:120])
+                        break
+                    continue
+                logger.warning("[Codex] %s：登录页仍在跳转，1s 后重试提交邮箱：%s", label, msg[:120])
+                time.sleep(1.0)
+        if email_result is not None:
+            if entry_index:
+                logger.info("[Codex] %s：登录入口 %s 生效", label, entry_url)
+            break
+    if email_result is None:
+        raise RuntimeError(
+            f"[Codex] {label}：{len(entry_urls)} 个登录入口都没能进入邮箱表单"
+            f"（最后一次：{last_error[:200]}）。"
+            "页面能打开但进不到邮箱输入框，通常是出口 IP 被区别对待，试试关闭代理池或换一条住宅代理。"
+        )
+    if email_result is None:
+        raise RuntimeError(f"[Codex] {label}：未能进入邮箱登录页")
+    email_stage = str(email_result.get("next_stage") or "").strip().lower()
+    logger.info("[Codex] %s：提交邮箱后进入阶段：%s", label, email_stage or "unknown")
+    if not email_stage:
+        # The in-page check gave up, but that check lives inside one document and
+        # only understands the languages hardcoded in it. Before writing the run
+        # off, watch the tab itself — a slow proxy can land /email-verification
+        # after the judgement window closed, and killing the job there throws
+        # away an OTP that was actually sent.
+        email_stage = _wait_for_post_email_landing(logger, label)
+    if not email_stage:
+        # Nothing on the page said "an OTP was sent" (no code inputs, no
+        # /email-verification, no password page…). Historically we polled the
+        # mailbox anyway and, 90s later, failed with "等待通用 API 验证码超时；
+        # HTTP 200 但未提取到验证码" — which blames the mailbox for a mail that was
+        # never sent and hides where the browser actually ended up. Dump the page
+        # and stop now: the account can be retried, and the log finally names the
+        # real page.
+        state = email_result.get("state") if isinstance(email_result.get("state"), dict) else {}
+        buttons = ", ".join(
+            str(item.get("text") or "").strip()
+            for item in (state.get("buttons") or [])
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        )
+        logger.warning(
+            "[Codex] %s：提交邮箱后落到未识别页面 url=%s title=%s headings=%s buttons=%s",
+            label,
+            state.get("url") or "",
+            state.get("title") or "",
+            " | ".join(str(item) for item in (state.get("headings") or []))[:200],
+            buttons[:300],
+        )
+        logger.warning("[Codex] %s：页面文本：%s", label, str(state.get("body_preview") or "")[:500])
+        raise RuntimeError(
+            f"[Codex] {label}：提交邮箱后落到未识别页面（{str(state.get('url') or '')[:120]}"
+            f" / {str(state.get('title') or '')[:60]}），验证码很可能没有发出，已提前结束以免空等取码。"
+        )
+    return email_stage
+
+
 def _login_account_in_browser(
     settings: Settings,
     mailbox: dict,
@@ -714,49 +1529,20 @@ def _login_account_in_browser(
     password: str = "",
     totp_provider=None,
     label: str = "登录",
-) -> tuple[object, str]:
+) -> tuple[object, str, dict | None]:
     """Log the account into ChatGPT (email + email OTP, or password + TOTP).
 
     This does NOT run the Codex OAuth authorize flow — no phone verification, no
-    consent, no SMS. Returns ``(codex_oauth_module, email)`` once the account is
-    logged in; raises on any failure.
+    consent, no SMS. Returns ``(codex_oauth_module, email, session)`` once the
+    account is logged in; raises on any failure.
     """
     codex_oauth = _ensure_upstream_imports(settings)
     logger = codex_oauth.logger
     email = str(mailbox.get("email") or "").strip()
-    source = str(mailbox.get("source") or "").strip().lower()
-    password_totp_login = source == "password_totp"
-
-    logger.info("[Codex] %s：账号开始前清理浏览器（保持隐私模式）", label)
-    _bridge_cleanup()
-    # After a cookie wipe, auth.openai.com/log-in shows a "你的会话已结束"
-    # interstitial with only a "登录" link (no email form). The real email-entry
-    # page is reached via chatgpt.com/auth/login_with, which mints the session
-    # context first. Go straight there — loading the heavy chatgpt.com SPA root
-    # first only risks a 45s "标签页加载超时" without helping.
-    _bridge_navigate("https://chatgpt.com/auth/login_with?callback_path=/")
-    time.sleep(2.0)
-
-    # /auth/login_with is a redirect endpoint that bounces through several hops
-    # before the email form settles; submit_email can inject into a frame that is
-    # torn down mid-redirect ("Frame with ID X was removed"). Retry a few times —
-    # once the redirect chain settles the email form is there.
-    email_result = None
-    for submit_attempt in range(1, 6):
-        try:
-            email_result = _bridge_page_action("submit_email", email=email)
-            break
-        except RuntimeError as exc:
-            msg = str(exc)
-            transient = _is_frame_teardown_error(msg) or bool(re.search(r"标签页加载超时|超时", msg))
-            if not transient or submit_attempt >= 5:
-                raise
-            logger.warning("[Codex] %s：登录页仍在跳转，2s 后重试提交邮箱（第 %d 次）：%s", label, submit_attempt + 1, msg[:120])
-            time.sleep(2.0)
-    if email_result is None:
-        raise RuntimeError(f"[Codex] {label}：未能进入邮箱登录页")
-    email_stage = str(email_result.get("next_stage") or "").strip().lower()
-    logger.info("[Codex] %s：提交邮箱后进入阶段：%s", label, email_stage or "unknown")
+    password_totp_login = str(mailbox.get("source") or "").strip().lower() == "password_totp"
+    email_stage = _open_login_and_submit_email(
+        settings, mailbox, email=email, logger=logger, label=label
+    )
 
     if password_totp_login:
         if not password or not callable(totp_provider):
@@ -870,6 +1656,1077 @@ def _run_login_only(settings: Settings, mailbox: dict, *, otp_provider, password
         email=email,
         message="已登录 ChatGPT（仅登录模式，未导出 Session、未走 OAuth）",
     )
+
+
+# ------------------------------------------------------------- smsbower-gmail 注册
+# The only path in this repo that CREATES an account. A gmail address rented
+# from smsbower is registered on chatgpt.com, given a generated password, and
+# verified with the code the rental delivers. 不接码（短信）、不走 OAuth.
+_REGISTER_FAILED_TOKEN = "register_failed"
+# 地址已经有账号了：既注册不了、我们也没有它的密码登录不进去，直接放弃。
+# 单独一个令牌，好让调度器分类成"已注册帐号"而不是笼统的注册失败。
+_ACCOUNT_EXISTS_TOKEN = "account_already_registered"
+_REGISTER_PASSWORD_LENGTH = 12
+_CHATGPT_URL_RE = re.compile(r"^https?://([^/]*\.)?chatgpt\.com(/|$)", re.I)
+
+
+def _generate_register_password(length: int = _REGISTER_PASSWORD_LENGTH) -> str:
+    """A 12-char password of letters and digits only.
+
+    Deliberately narrower than :func:`_generate_signup_password`: the需求 spells
+    out "仅包含大小写字母、数字", and this password is exported as the middle
+    column of ``email----密码----密钥``, where a ``----`` or ``|`` in the value
+    would corrupt the line.
+    """
+
+    size = max(8, int(length))
+    alphabet = string.ascii_letters + string.digits
+    while True:
+        password = "".join(secrets.choice(alphabet) for _ in range(size))
+        if (
+            any(char.islower() for char in password)
+            and any(char.isupper() for char in password)
+            and any(char.isdigit() for char in password)
+        ):
+            return password
+
+
+class _RegisterStopped(Exception):
+    """The operator pressed 停止后续任务 during a long wait."""
+
+
+def _raise_if_stopped(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise _RegisterStopped()
+
+
+def _register_failure(message: str) -> RuntimeError:
+    """Terminal registration failure: the rental is spent, retrying wastes another."""
+
+    return RuntimeError(f"[Codex] {_REGISTER_FAILED_TOKEN}：{message}")
+
+
+def _account_exists_failure(email: str, where: str) -> RuntimeError:
+    """The address already has an OpenAI account — abandon it, never retry.
+
+    只有在**已经走了注册入口 /create-account** 的前提下落到登录密码页，才能这么
+    判。历史上注册误用了 /log-in（登录页），任何全新地址都会被回「输入密码」，
+    当时把它读成"已注册"是误判，会把好号白白丢掉。改判据前先确认入口是对的。
+    """
+
+    return RuntimeError(
+        f"[Codex] {_ACCOUNT_EXISTS_TOKEN}：已注册帐号 —— {email} 已存在 OpenAI 账号（{where}），放弃该账号"
+    )
+
+
+def _smsbower_mail_runtime(settings: Settings):
+    from .smsbower_mail import SmsbowerMailClient
+    from .smsbower_mail_store import SmsbowerMailConfigStore
+
+    config = SmsbowerMailConfigStore(Path(settings.data_dir)).get()
+    if not config.get("api_key"):
+        raise _register_failure("smsbower 邮箱 API Key 尚未配置")
+    return SmsbowerMailClient(config["api_key"]), config
+
+
+def _wait_for_smsbower_code(
+    logger,
+    client,
+    mail_id: int,
+    *,
+    timeout: float,
+    interval: float,
+    exclude: list[str],
+    label: str,
+    cancel_event=None,
+) -> str:
+    """Poll ``getCode`` until a code the caller has not tried yet shows up.
+
+    Returns "" on timeout — the caller decides whether that ends the account.
+    A provider hiccup is logged and retried; only a dead activation aborts,
+    because polling a cancelled rental can never succeed.
+
+    Raises ``_RegisterStopped`` when the user stops the pipeline: this loop can
+    run for two full codeTimeout windows, and a worker thread cannot be
+    force-killed, so without this cooperative check "停止后续任务" appears dead.
+    """
+
+    from .smsbower_mail import (
+        SmsbowerMailActivationGoneError,
+        SmsbowerMailCodePendingError,
+        SmsbowerMailError,
+    )
+
+    started = time.time()
+    deadline = started + max(1.0, float(timeout))
+    attempt = 0
+    while time.time() < deadline:
+        _raise_if_stopped(cancel_event)
+        attempt += 1
+        # 每一轮都往侧边栏推一条：取码是这条流水线里最长的一段静默期，
+        # 不报进度用户只能干等，也分不清"还没到"和"卡死了"。
+        elapsed = int(time.time() - started)
+        remaining = max(0, int(deadline - time.time()))
+        try:
+            code = client.fetch_code(mail_id)
+        except SmsbowerMailCodePendingError:
+            code = ""
+            notices.push(
+                f"取码第 {attempt} 次：验证码还没到（已等 {elapsed}s，剩 {remaining}s）",
+                scope="smsbower",
+            )
+        except SmsbowerMailActivationGoneError as exc:
+            notices.push(f"取码失败：{exc}", level="error", scope="smsbower")
+            raise _register_failure(str(exc)) from exc
+        except SmsbowerMailError as exc:
+            logger.warning("[Codex] %s：取码接口异常，继续等待：%s", label, str(exc)[:160])
+            notices.push(
+                f"取码第 {attempt} 次：接口异常，继续等待（{str(exc)[:80]}）",
+                level="warn",
+                scope="smsbower",
+            )
+            code = ""
+        if code and code in exclude:
+            notices.push(
+                f"取码第 {attempt} 次：拿到的还是上一轮那枚旧码，继续等新码",
+                level="warn",
+                scope="smsbower",
+            )
+        if code and code not in exclude:
+            logger.info("[Codex] %s：已收到验证码", label)
+            notices.push(f"取码成功：{code}（用时 {elapsed}s）", level="success", scope="smsbower")
+            return code
+        # Sleep in short slices so a stop request lands within ~1s instead of
+        # waiting out a full poll interval.
+        slept = 0.0
+        step = min(1.0, max(0.1, float(interval)))
+        while slept < max(1.0, float(interval)):
+            _raise_if_stopped(cancel_event)
+            time.sleep(step)
+            slept += step
+    notices.push(
+        f"取码超时：{int(timeout)}s 内没有收到新的验证码", level="error", scope="smsbower"
+    )
+    return ""
+
+
+def _wait_for_register_landing(logger, label: str, *, timeout: float = 30.0) -> str:
+    """Watch the tab's own URL after an OTP/about-you submit.
+
+    Submitting can tear the injected frame down mid-navigation, so the in-page
+    answer is often lost. The tab URL survives that and is immune to the page's
+    language.
+    """
+
+    interval = 1.0
+    for _ in range(max(1, int(max(1.0, timeout) / interval))):
+        result = _bridge_request("tab_url", {}, timeout=20.0, raise_on_error=False)
+        url = str(result.get("url") or "").lower()
+        if "/about-you" in url:
+            return "about-you"
+        if _CHATGPT_URL_RE.match(url):
+            return "chatgpt"
+        if "/email-verification" in url:
+            return "otp"
+        if "/create-account/password" in url:
+            return "create-account-password"
+        if "/phone-verification" in url or "/add-phone" in url:
+            return "phone"
+        time.sleep(interval)
+    logger.info("[Codex] %s：标签页 URL 在 %ss 内没有变化", label, int(timeout))
+    return ""
+
+
+_PRICING_URL = "https://chatgpt.com/#pricing"
+# 落到 /log-in/password 时最多用 Sign up 链接救回来几次。
+_SIGNUP_RECOVER_ROUNDS = 2
+
+
+# 点「Sign up」之后的落点。/create-account/password 必须排在 /create-account
+# 前面——后者是前者的前缀，顺序反了会把设密码页认成邮箱表单再白提交一次邮箱。
+_SIGNUP_LINK_URLS = (
+    ("/create-account/password", "create-account-password"),
+    ("/email-verification", "otp"),
+    ("/create-account", "create-account"),
+)
+
+
+def _click_signup_link(logger, *, label: str) -> dict:
+    """点登录密码页底部的「Sign up」回到注册流程。
+
+    又是一个"点了就会跳页"的步骤：导航会销毁注入帧，`Frame with ID X was removed`
+    和静默的"页面动作返回空结果"都代表**点成功了**，不能当失败。
+    """
+
+    try:
+        return _bridge_page_action("click_signup_link")
+    except RuntimeError as exc:
+        if not _is_frame_teardown_error(exc) and "浏览器桥接超时" not in str(exc):
+            raise
+        logger.info(
+            "[Codex] %s：点「Sign up」后注入帧被销毁（页面正在跳转），改读标签页 URL 判落点：%s",
+            label,
+            str(exc)[:160],
+        )
+        stage = _wait_for_tab_stage(
+            logger, label, targets=_SIGNUP_LINK_URLS, timeout=25.0, step="点「Sign up」"
+        )
+        if stage:
+            return {"ok": True, "next_stage": stage, "frame_teardown": True}
+        # 回不到注册流程就照实说；调用方会把它当"救不回来"处理，不会误判成已注册。
+        return {"ok": True, "next_stage": "", "frame_teardown": True}
+
+
+def _recover_signup_from_login_password(logger, *, label: str, email: str) -> str:
+    """从 `/log-in/password` 点「Sign up」回到注册流程，并重新提交邮箱。
+
+    该页底部有 `Don't have an account? <a href="/create-account">Sign up</a>`
+    （快照 1038377682-…-175759），点它就回到真正的注册入口——比把账号判死刑好得多。
+    返回重新提交邮箱后的阶段；救不回来时返回 ""。
+    """
+
+    result = _click_signup_link(logger, label=label)
+    if result.get("signup_link_missing"):
+        logger.warning("[Codex] %s：登录密码页上没有「Sign up」链接，无法回到注册流程", label)
+        return ""
+    stage = str(result.get("next_stage") or "").strip().lower()
+    logger.info("[Codex] %s：已点「Sign up」回到注册流程，当前阶段：%s", label, stage or "unknown")
+    if stage == "create-account-password":
+        # 已经直接落到设密码页，不用再提交邮箱。
+        return stage
+    if stage == "otp":
+        return stage
+    # 落在 /create-account 的邮箱表单上：重新提交一次邮箱。
+    email_result = _submit_login_step(
+        "submit_email", label=label, step="重新提交邮箱", logger=logger, email=email
+    )
+    new_stage = str(email_result.get("next_stage") or "").strip().lower()
+    if not new_stage:
+        new_stage = _wait_for_post_email_landing(logger, label)
+    logger.info("[Codex] %s：回到注册流程后提交邮箱，进入阶段：%s", label, new_stage or "unknown")
+    return new_stage
+
+
+def _probe_plus_trial(logger, *, label: str) -> bool:
+    """注册成功后看 chatgpt.com/#pricing 顶部有没有「Try Plus free for 1 month」。
+
+    纯只读探测，不点任何东西。账号此时已经建成，所以这里**任何失败都只降级成
+    "没有资格"并 warning**，绝不把一个注册成功的账号判失败。
+    """
+
+    try:
+        # 已经在 chatgpt.com 上时这是一次 hash 跳转，标签页不会重新加载，所以
+        # 允许超时——真正判断"页面渲染出来没有"的是探测动作自己。
+        _bridge_navigate(_PRICING_URL, tolerate_timeout=True, retries=0)
+        result = _bridge_page_action("probe_plus_offer")
+    except RuntimeError as exc:
+        logger.warning("[Codex] %s：Plus 免费资格探测失败，按无资格记录：%s", label, str(exc)[:200])
+        return False
+    value = result.get("plus_trial")
+    if value is None:
+        logger.warning(
+            "[Codex] %s：#pricing 页面没渲染出来（url=%s），无法确认 Plus 资格，按无资格记录",
+            label,
+            str(result.get("url") or "")[:120],
+        )
+        return False
+    if value:
+        logger.info(
+            "[Codex] %s：检测到 Plus 免费资格：%s", label, str(result.get("matched_text") or "")[:80]
+        )
+    return bool(value)
+
+
+_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Security"
+# 开启 MFA 时可能被要求重新验证身份，验证完要回到设置页再开一次。
+_MFA_ROUNDS = 2
+# 读 Base32 密钥的重试轮数（每轮内部扩展自己还会点 3 次「Trouble scanning?」）。
+_MFA_REVEAL_ROUNDS = 3
+# 自动读取和二维码都失败之后，等人工把密钥显示出来的总时长与轮询间隔。
+# **绝不允许跳过这一步去跑下一个账号**：密钥只显示这一次，跳过 = 账号作废。
+# 唯一的出口是用户自己点「停止后续任务」（cancel_event），或者等满这个时长。
+_MFA_MANUAL_WAIT_SECONDS = 1800.0
+_MFA_MANUAL_POLL_SECONDS = 5.0
+# 人工等待也超时了才会带上这个令牌。用它把"还没求助过人"和"人也没来"区分开：
+# 前者要转人工，后者再等一个 30 分钟没有任何意义。
+_MFA_MANUAL_TIMEOUT_TOKEN = "mfa_manual_wait_timeout"
+
+
+def _safe_totp_secret(value: str) -> str:
+    """把页面读到的东西规范成 Base32 密钥；不合法就返回 ""（不抛错）。"""
+
+    try:
+        return normalize_totp_secret(str(value or ""))
+    except Exception:
+        return ""
+
+
+def _secret_from_otpauth(uri: str) -> str:
+    """从 `otpauth://totp/...?secret=XXXX` 里取出密钥。"""
+
+    match = re.search(r"[?&]secret=([A-Za-z2-7=]+)", str(uri or ""), re.I)
+    return _safe_totp_secret(match.group(1)) if match else ""
+
+
+def _decode_totp_qr(data_url: str, *, logger, label: str) -> str:
+    """把二维码图片解码成 otpauth:// 里的 Base32 密钥。
+
+    可选依赖，按可用性依次尝试 opencv → pyzbar；两个都没装就照实说清楚该装什么，
+    再交给人工兜底——绝不静默失败。
+    """
+
+    raw = _decode_image_data_url(data_url)
+    if not raw:
+        return ""
+    # opencv：pip 一条命令就能装，Windows 上不需要额外的原生依赖。
+    try:
+        import numpy  # type: ignore
+        import cv2  # type: ignore
+
+        image = cv2.imdecode(numpy.frombuffer(raw, dtype=numpy.uint8), cv2.IMREAD_GRAYSCALE)
+        if image is not None:
+            detector = cv2.QRCodeDetector()
+            for candidate in (image, cv2.bitwise_not(image)):
+                # 深色模式下二维码是反相的，两种都试一遍。
+                text = detector.detectAndDecode(candidate)[0]
+                secret = _secret_from_otpauth(text) or _safe_totp_secret(text)
+                if secret:
+                    logger.info("[Codex] %s：opencv 解出了二维码", label)
+                    return secret
+    except ImportError:
+        logger.warning(
+            "[Codex] %s：没装 opencv，无法解二维码（pip install opencv-python-headless）", label
+        )
+    except Exception as exc:  # 解码器自身出错不该影响后续兜底
+        logger.warning("[Codex] %s：opencv 解二维码失败：%s", label, str(exc)[:160])
+    try:
+        import io
+
+        from PIL import Image, ImageOps  # type: ignore
+        from pyzbar.pyzbar import decode as zbar_decode  # type: ignore
+
+        image = Image.open(io.BytesIO(raw)).convert("L")
+        for candidate in (image, ImageOps.invert(image)):
+            for item in zbar_decode(candidate):
+                text = item.data.decode("utf-8", errors="replace")
+                secret = _secret_from_otpauth(text) or _safe_totp_secret(text)
+                if secret:
+                    logger.info("[Codex] %s：pyzbar 解出了二维码", label)
+                    return secret
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning("[Codex] %s：pyzbar 解二维码失败：%s", label, str(exc)[:160])
+    return ""
+
+
+def _decode_image_data_url(data_url: str) -> bytes:
+    """`data:image/png;base64,....` → 原始字节。"""
+
+    value = str(data_url or "")
+    if "," not in value or not value.lower().startswith("data:"):
+        return b""
+    try:
+        return base64.b64decode(value.split(",", 1)[1], validate=False)
+    except (ValueError, binascii.Error):
+        return b""
+
+
+def _secret_from_qr(logger, *, label: str) -> str:
+    """截下 MFA 弹窗里的二维码并解码。任何一步失败都只 warning，交给人工兜底。"""
+
+    try:
+        shot = _bridge_page_action("mfa_capture_qr", timeout=60.0, raise_on_error=False)
+    except RuntimeError as exc:
+        logger.warning("[Codex] %s：二维码截图失败：%s", label, str(exc)[:160])
+        return ""
+    if not shot.get("ok"):
+        logger.warning("[Codex] %s：二维码截图失败：%s", label, str(shot.get("error") or "")[:160])
+        return ""
+    return _decode_totp_qr(str(shot.get("qr_image") or ""), logger=logger, label=label)
+
+
+def _reveal_totp_secret(logger, *, label: str, cancel_event=None) -> str:
+    """拿到 Base32 密钥。**这一步绝不轻易放弃**：
+
+      3 轮"点 Trouble scanning? + 读页面" → 解二维码 → 转人工等待。
+
+    OpenAI 这串密钥只显示这一次，读不到就等于这个账号废掉，所以宁可卡在这里等人，
+    也绝不跳过去跑下一个账号。
+    """
+
+    last_reason = ""
+    for attempt in range(1, _MFA_REVEAL_ROUNDS + 1):
+        _raise_if_stopped(cancel_event)
+        try:
+            result = _bridge_page_action("mfa_reveal_secret")
+        except RuntimeError as exc:
+            last_reason = str(exc)
+            logger.warning(
+                "[Codex] %s：第 %d/%d 次读取 2FA 密钥出错：%s",
+                label,
+                attempt,
+                _MFA_REVEAL_ROUNDS,
+                last_reason[:160],
+            )
+            time.sleep(2.0)
+            continue
+        secret = _safe_totp_secret(result.get("secret")) or _secret_from_otpauth(result.get("otpauth"))
+        if secret:
+            logger.info("[Codex] %s：第 %d 次尝试读到 2FA 密钥", label, attempt)
+            return secret
+        last_reason = "页面上没有显示 Base32 密钥"
+        logger.warning(
+            "[Codex] %s：第 %d/%d 次没读到 Base32 密钥，继续重试", label, attempt, _MFA_REVEAL_ROUNDS
+        )
+        notices.push(f"2FA 密钥没读到，正在重试（{attempt}/{_MFA_REVEAL_ROUNDS}）…", scope="mfa")
+        time.sleep(2.0)
+
+    _raise_if_stopped(cancel_event)
+    logger.warning("[Codex] %s：%d 次都没读到 Base32 密钥，改为解析二维码", label, _MFA_REVEAL_ROUNDS)
+    notices.push("2FA 密钥读不到，正在尝试解析二维码…", scope="mfa")
+    secret = _secret_from_qr(logger, label=label)
+    if secret:
+        logger.info("[Codex] %s：已从二维码解出 2FA 密钥", label)
+        return secret
+
+    return _wait_for_manual_totp_secret(
+        logger, label=label, cancel_event=cancel_event, reason=last_reason
+    )
+
+
+def _wait_for_manual_totp_secret(
+    logger, *, label: str, cancel_event=None, reason: str = "", hint: str = ""
+) -> str:
+    """转人工：卡在这里等，**绝不跳过这个账号**。
+
+    页面就停在 MFA 弹窗上（或停在设置页——自动流程更早的地方就失败时也走这里）。
+    请在浏览器里把 32 位密钥显示出来，这里每 5s **只读一次页面、不点任何东西**
+    （免得和人抢着点），一读到就自动接着往下走。要放弃只能按侧边栏的「停止后续任务」。
+    """
+
+    hint = hint or (
+        "⚠ 需要手动操作：自动读取和二维码解码都失败了。请在浏览器的 2FA 弹窗里点"
+        "「Trouble scanning?」把 32 位密钥显示出来，程序会自动读取并继续（不想等就点"
+        "「停止后续任务」）"
+    )
+    logger.warning("[Codex] %s：%s（原因：%s）", label, hint, reason[:120] or "未知")
+    notices.push(hint, scope="mfa")
+    rounds = max(1, int(_MFA_MANUAL_WAIT_SECONDS / _MFA_MANUAL_POLL_SECONDS))
+    for index in range(rounds):
+        _raise_if_stopped(cancel_event)
+        # read_only：只读不点，人在操作时不会被我们抢走焦点。
+        result = _bridge_page_action("mfa_reveal_secret", read_only=True, raise_on_error=False)
+        secret = _safe_totp_secret(result.get("secret")) or _secret_from_otpauth(result.get("otpauth"))
+        if secret:
+            logger.info("[Codex] %s：已读到人工显示出来的 2FA 密钥，继续往下走", label)
+            notices.push("已读到 2FA 密钥，继续自动执行", scope="mfa")
+            return secret
+        # 每分钟再顺手试一次二维码：用户可能把弹窗切回了二维码视图。
+        if index and index % 12 == 0:
+            secret = _secret_from_qr(logger, label=label)
+            if secret:
+                logger.info("[Codex] %s：等待期间从二维码解出了 2FA 密钥", label)
+                return secret
+            waited = int(index * _MFA_MANUAL_POLL_SECONDS)
+            logger.warning("[Codex] %s：仍在等待人工显示 2FA 密钥（已等 %ds）", label, waited)
+            notices.push(f"仍在等待手动显示 2FA 密钥（已等 {waited // 60} 分钟）…", scope="mfa")
+        time.sleep(_MFA_MANUAL_POLL_SECONDS)
+    raise RuntimeError(
+        f"[Codex] {_MFA_MANUAL_TIMEOUT_TOKEN}：等待人工提供 2FA 密钥超时"
+        f"（{int(_MFA_MANUAL_WAIT_SECONDS / 60)} 分钟）"
+    )
+
+
+def _run_mfa_enrollment(
+    logger, *, label: str, password: str, on_secret=None, cancel_event=None
+) -> str:
+    """需求步骤 7-9：给刚注册好的账号开启验证器 App 并取回 Base32 密钥。
+
+    #settings/Security → Security and login → Authenticator app
+      → （可能的身份验证挑战：Continue with password + 刚生成的密码）
+      → Trouble scanning? → 读密钥 → 用密钥算 TOTP 填回去 → Verify
+
+    **这一整段任何一步失败都不会直接放弃**：密钥 OpenAI 只显示这一次，跳过去跑下
+    一个账号就等于把这个账号废掉。所以自动流程一旦走不通（打不开设置、身份验证
+    没过、弹窗没出来……）一律转人工等待（`_wait_for_manual_totp_secret`，30 分钟，
+    期间只读不点），等人在浏览器里把密钥点出来再自动接上；用户按「停止后续任务」
+    才是唯一的提前出口。
+    """
+
+    try:
+        secret = _open_mfa_dialog_and_reveal(
+            logger, label=label, password=password, cancel_event=cancel_event
+        )
+    except _RegisterStopped:
+        raise
+    except Exception as exc:
+        reason = str(exc)
+        if _MFA_MANUAL_TIMEOUT_TOKEN in reason:
+            # 已经等过一轮人工了（密钥读取那步自己会转人工），别再等第二个 30 分钟。
+            raise
+        logger.warning("[Codex] %s：自动开启 2FA 走不通，转人工：%s", label, reason[:200])
+        secret = _wait_for_manual_totp_secret(
+            logger,
+            label=label,
+            cancel_event=cancel_event,
+            reason=reason,
+            hint=(
+                "⚠ 需要手动操作：自动开启 2FA 失败（"
+                + reason[:120]
+                + "）。请在浏览器里手动打开 设置 → Security → Authenticator app，"
+                "点「Trouble scanning?」把 32 位密钥显示出来，程序会自动读取并继续"
+                "（不想等就点「停止后续任务」）"
+            ),
+        )
+    # 立刻落盘 + 立刻写日志，**在提交验证码之前**。
+    # 血的教训：原来等"提交验证码成功"才保存，而那一步曾经误判失败抛异常，密钥
+    # 随异常一起丢了——账号的 2FA 已经真的开启，却再也拿不到密钥，等于账号废掉。
+    # OpenAI 这串密钥**只显示这一次**，所以规则是：读到即持久化，绝不押在后续
+    # 任何一步的成败上。日志里也留一份，这是本机单用户工具，密钥本来就会随素材导出。
+    if on_secret is not None:
+        on_secret(secret)
+    logger.info("[Codex] %s：已取得 2FA 密钥并立即落盘：%s", label, secret)
+    notices.push("已取得 2FA 密钥（已保存），正在提交验证码", scope="mfa")
+
+    # current_totp 自带 min_valid_seconds=4：剩余有效期不足就先等下一轮，
+    # 满足需求"有效时间小于 3 秒则继续等待下一轮验证码"。
+    submitted = _submit_login_step(
+        "mfa_submit_code",
+        label=label,
+        step="提交 2FA 验证码",
+        logger=logger,
+        code=current_totp(secret),
+    )
+    error = str(submitted.get("error_text") or "").strip()
+    # 判据顺序很重要：先认"弹层已消失 = 成功"，再看错误文本。
+    # 成功后 OpenAI 会弹「Authenticator app enabled」这类提示，它落在 [role=alert]
+    # 区域里，早期被当成错误，把一个已经开好的 2FA 误报成"验证码未通过"。
+    if submitted.get("verified") or submitted.get("frame_teardown"):
+        logger.info("[Codex] %s：验证器 App 已开启", label)
+        return secret
+    if error:
+        raise RuntimeError(f"[Codex] 2FA 验证码未通过：{error[:200]}")
+    raise RuntimeError("[Codex] 提交 2FA 验证码后弹层仍未关闭，无法确认是否开启成功")
+
+
+def _open_mfa_dialog_and_reveal(
+    logger, *, label: str, password: str, cancel_event=None
+) -> str:
+    """自动路径：打开验证器弹窗并读出 Base32 密钥（失败抛异常，由调用方转人工）。"""
+
+    stage = ""
+    for attempt in range(1, _MFA_ROUNDS + 1):
+        _bridge_navigate(_SECURITY_SETTINGS_URL, tolerate_timeout=True, retries=0)
+        # 这次导航是整页刷新，"You're all set" 欢迎弹层会**重新弹出来**（它在 load
+        # 之后才画出来）。必须先等它出现并点掉，再去操作设置页——否则整页被 inert，
+        # 下面每一次点击都落空，还会被报成"点击 Authenticator app 后没弹出 MFA 弹窗"。
+        _dismiss_blocking_dialog(logger, label=label, wait_ms=8000)
+        opened = _submit_login_step(
+            "open_mfa_enroll", label=label, step="打开 MFA 设置", logger=logger
+        )
+        stage = str(opened.get("next_stage") or "").strip().lower()
+        logger.info("[Codex] %s：打开 MFA 设置后进入阶段：%s", label, stage or "unknown")
+        if stage == "dialog":
+            break
+        if stage == "challenge":
+            # 这里要的正是 /log-in/password —— 账号是我们自己刚建的，密码在手上。
+            logger.info("[Codex] %s：开启 MFA 触发了身份验证，改用密码验证", label)
+            notices.push("开启 MFA 触发身份验证，正在用刚设置的密码验证", scope="mfa")
+            challenge = _submit_login_step(
+                "mfa_password_challenge",
+                label=label,
+                step="MFA 密码验证",
+                logger=logger,
+                password=password,
+            )
+            challenge_error = str(challenge.get("error_text") or "").strip()
+            if challenge_error:
+                raise RuntimeError(f"[Codex] MFA 身份验证失败：{challenge_error[:200]}")
+            if attempt >= _MFA_ROUNDS:
+                raise RuntimeError("[Codex] MFA 身份验证后仍未能打开验证器设置")
+            continue
+        if attempt >= _MFA_ROUNDS:
+            raise RuntimeError(f"[Codex] 打开 MFA 设置失败（阶段 {stage or 'unknown'}）")
+        # 阶段不对**不代表没救**：欢迎弹层可能刚好又弹了一次、设置页还没渲染完。
+        # 重新导航一轮再试，实在不行才由调用方转人工。
+        logger.warning(
+            "[Codex] %s：打开 MFA 设置返回阶段 %s，重新进设置页再试（第 %d/%d 轮）",
+            label,
+            stage or "unknown",
+            attempt,
+            _MFA_ROUNDS,
+        )
+        time.sleep(2.0)
+    if stage != "dialog":
+        raise RuntimeError("[Codex] 未能打开 MFA 设置弹窗")
+
+    # 3 轮点击重试 → 解二维码 → 转人工等待。**读不到就一直卡在这里，绝不跳过**。
+    return _reveal_totp_secret(logger, label=label, cancel_event=cancel_event)
+
+
+def _dismiss_blocking_dialog(logger, *, label: str, wait_ms: int = 0) -> bool:
+    """点掉注册完成后 chatgpt.com 弹的那个原生 <dialog>（"You're all set"）。
+
+    它是 `showModal()` 打开的，会把页面其余部分置为 inert —— 不点掉，后面探 Plus
+    资格和开 MFA 的每一次点击都会点空。纯善后动作，失败只 warning。
+
+    ``wait_ms``：**等它出现**再点。它是 React 的 blocking initial modal，在页面
+    load 之后才画出来，每次整页刷新还会重新弹一次；只在调用的那一瞬间看一眼多半
+    看不到（踩过坑：这里悄悄返回"没有弹层"，MFA 于是全程点空，最后报成"点击
+    Authenticator app 后没弹出 MFA 弹窗"，真因被藏了整整一轮）。
+
+    返回"页面当前没有被弹层挡住"。
+    """
+
+    try:
+        result = _bridge_page_action("dismiss_blocking_dialog", wait_ms=int(wait_ms))
+    except RuntimeError as exc:
+        logger.warning("[Codex] %s：关闭欢迎弹层失败（继续往下走）：%s", label, str(exc)[:160])
+        return False
+    if result.get("dismissed"):
+        logger.info(
+            "[Codex] %s：已点掉注册完成后的欢迎弹层（%s 个）",
+            label,
+            result.get("dismissed_count") or 1,
+        )
+    if result.get("still_blocked"):
+        # 这条一定要打：弹层没关掉时后面每一次点击都是点在 inert 页面上。
+        logger.warning(
+            "[Codex] %s：欢迎弹层「%s」仍在且点不掉，后续点击会被挡住",
+            label,
+            str(result.get("blocking_label") or "")[:60],
+        )
+        return False
+    if not result.get("dismissed"):
+        # 也要打：以前这里什么都不打，日志上看不出"到底查过没有"。
+        logger.info("[Codex] %s：当前没有需要关闭的欢迎弹层", label)
+    return True
+
+
+def _run_account_signup(settings: Settings, mailbox: dict, *, cancel_event=None) -> dict:
+    """Register one rented smsbower gmail on chatgpt.com (需求步骤 1-6).
+
+    email → /email-verification → Continue with password → 设密码 → 邮箱验证码 →
+    /about-you → chatgpt.com. No SMS, no OAuth, no phone verification.
+
+    ``cancel_event`` makes 停止后续任务 take effect during the two codeTimeout
+    windows: a worker thread cannot be force-killed, so every long wait polls it.
+    """
+
+    from .smsbower_mail import MAIL_STATUS_CANCEL, MAIL_STATUS_FINISH, MAIL_STATUS_NEXT_CODE
+
+    try:
+        codex_oauth = _ensure_upstream_imports(settings)
+    except Exception:
+        # 连上游模块都加载不了：账号一步都没跑，把号退回去，别让它空转计费。
+        _settle_mailbox_rental(settings, mailbox, reason="上游模块加载失败，注册无法开始")
+        raise
+    logger = codex_oauth.logger
+    label = "注册"
+    email = str(mailbox.get("email") or "").strip()
+    try:
+        mail_id = int(str(mailbox.get("mail_id") or "").strip())
+    except ValueError:
+        mail_id = 0
+    if mail_id <= 0:
+        raise _register_failure(f"账号 {email} 没有 smsbower 活动 id，无法取码")
+
+    try:
+        client, config = _smsbower_mail_runtime(settings)
+    except Exception as exc:
+        # 客户端都建不起来（多半是 API Key 没配）：这个号**没法结算**，会一直计费。
+        # 说清楚，别让它悄悄消失在一条通用报错里。
+        logger.warning(
+            "[Codex] %s：smsbower 客户端不可用，mail_id=%s 无法执行 setStatus，"
+            "该邮箱可能仍在计费，请到 smsbower 后台手动关闭：%s",
+            label,
+            mail_id,
+            str(exc)[:160],
+        )
+        raise
+    store = MailboxStore(Path(settings.data_dir))
+    code_timeout = float(config["code_timeout_seconds"])
+    code_interval = float(config["code_interval_seconds"])
+    password = _generate_register_password()
+    # 重跑的账号：上一轮可能已经把号建出来并设过密码（`update_registration` 在提交
+    # 密码**之前**就落盘了，正是为这一刻）。OpenAI 记得那个密码，所以本轮必须沿用
+    # 它——另生成一个新密码就再也登不进这个已存在的账号了。
+    known_password = str((store.get_secret(email=email) or {}).get("password") or "").strip()
+    if known_password:
+        password = known_password
+        logger.info("[Codex] %s：该地址已存有上一轮设置的密码，本轮沿用它", label)
+    # Cancel unless the account actually gets created: an activation left open
+    # keeps billing, and status=3 on a failed run would pay for nothing.
+    release_status = MAIL_STATUS_CANCEL
+    try:
+        _raise_if_stopped(cancel_event)
+        email_stage = _open_login_and_submit_email(
+            settings,
+            mailbox,
+            email=email,
+            logger=logger,
+            label=label,
+            # 关键：走注册入口 /create-account，不是登录入口 /log-in。
+            # 代理下例外：auth.openai.com 拿不到注册表单，改从 chatgpt.com 首页点
+            # 右上角「Log in」进二合一弹窗（见 _PROXY_SIGNUP_ENTRY_URLS）。
+            entry_urls=_signup_entry_urls(mailbox),
+            signup=True,
+        )
+        _raise_if_stopped(cancel_event)
+        logger.info("[Codex] %s：提交邮箱后进入阶段：%s", label, email_stage or "unknown")
+
+        # 落到 /log-in/password 有两种情况，处理方式**完全相反**：
+        #   a) 这个地址上一轮已经被我们建过号、也设过密码（重跑）——OpenAI 记得那个
+        #      密码，把**存下来的那个**填回去就行，填对之后它要求邮箱验证，下一步
+        #      正好就是 /email-verification，接回原本的取码流程。把它判死刑等于白扔
+        #      一个已经建好的账号，还白烧一个取号。
+        #   b) 从没建过号——那是被拖进了登录流程，点该页底部的
+        #      `Don't have an account? Sign up`（href=/create-account）回注册流程。
+        # 两个可能落点（提交邮箱后、点 Continue with password 后）共用这套判断。
+        resumed_with_password = False
+        if email_stage == "login-password" and known_password:
+            email_stage = _resume_with_known_password(
+                logger, label=label, email=email, password=password
+            )
+            resumed_with_password = email_stage == "otp"
+        for _ in range(_SIGNUP_RECOVER_ROUNDS):
+            if email_stage != "login-password":
+                break
+            _raise_if_stopped(cancel_event)
+            logger.info("[Codex] %s：落到了登录密码页，点「Sign up」回到注册流程", label)
+            email_stage = _recover_signup_from_login_password(logger, label=label, email=email)
+        if email_stage == "login-password":
+            raise _register_failure(
+                "反复落到登录密码页，点「Sign up」也回不到注册流程，放弃该账号"
+            )
+        if email_stage not in {"otp", "create-account-password"}:
+            # 需求步骤 2：只有落到 /email-verification 才是一个可注册的新地址。
+            # 其它阶段一律判不了，这个号就作废。
+            raise _register_failure(
+                f"提交邮箱后没有进入验证码页（阶段 {email_stage or 'unknown'}），放弃该账号"
+            )
+
+        if email_stage == "otp" and not resumed_with_password:
+            logger.info("[Codex] %s：切换到密码注册", label)
+            notices.push("已到验证码页，正在切换到密码注册…", scope="signup")
+            switch_stage = _switch_to_password_signup(logger, label=label)
+            # 需求步骤 3 必须导向 /create-account/password。落到 /log-in/password
+            # 说明这个号已经存在——密码在手上就直接登录，没有才用 Sign up 救回来。
+            if switch_stage == "login-password" and known_password:
+                switch_stage = _resume_with_known_password(
+                    logger, label=label, email=email, password=password
+                )
+                resumed_with_password = switch_stage == "otp"
+            for _ in range(_SIGNUP_RECOVER_ROUNDS):
+                if switch_stage != "login-password":
+                    break
+                _raise_if_stopped(cancel_event)
+                logger.info(
+                    "[Codex] %s：「Continue with password」落到登录密码页，点「Sign up」回到注册流程",
+                    label,
+                )
+                recovered = _recover_signup_from_login_password(logger, label=label, email=email)
+                if recovered == "create-account-password":
+                    switch_stage = recovered
+                    break
+                if recovered == "otp":
+                    switch_stage = _switch_to_password_signup(logger, label=label)
+                    continue
+                switch_stage = recovered
+            if not resumed_with_password and switch_stage != "create-account-password":
+                raise _register_failure(
+                    f"切换密码注册后进入了 {switch_stage or 'unknown'} 页（需要 /create-account/password）"
+                )
+
+        if resumed_with_password:
+            # 密码本来就是这个账号的，不用再设一次；页面已经在 /email-verification 上。
+            logger.info("[Codex] %s：已用已存密码登录，跳过设置密码，直接等邮箱验证码", label)
+            notices.push("已用已存密码登录，正在等待邮箱验证码…", scope="signup")
+            store.update_registration(
+                email, status="pending", password=password, message="沿用已存密码，等待验证码"
+            )
+        else:
+            logger.info("[Codex] %s：设置账号密码", label)
+            # 慢代理下这一步实测能跑到 110s，是整条流水线最长的静默段之一。
+            notices.push("正在设置账号密码（慢代理下可能要 1-2 分钟）…", scope="signup")
+            # Persist before submitting: if the submit succeeds but this process dies
+            # right after, an account exists whose password would otherwise be lost.
+            store.update_registration(email, status="pending", password=password, message="已生成密码，等待验证码")
+            password_result = _submit_signup_password(logger, label=label, password=password)
+            password_error = str(password_result.get("error_text") or "").strip()
+            if password_error:
+                # 兜底：真走到了登录表单上（判据没拦住），OpenAI 会回这句。它只可能
+                # 出现在"已有账号 + 密码不对"的场景，注册流程里等价于该地址已注册。
+                if re.search(r"incorrect email address or password|邮箱地址或密码不正确", password_error, re.I):
+                    raise _account_exists_failure(email, "提交密码被判 Incorrect email address or password")
+                raise _register_failure(f"设置密码失败：{password_error[:200]}")
+            password_stage = str(password_result.get("next_stage") or "").strip().lower()
+            if password_stage != "otp":
+                raise _register_failure(f"设置密码后进入了 {password_stage or 'unknown'} 页，未回到验证码页")
+
+        # 需求步骤 5：轮询取码 → 提交；被判 Incorrect code 时再等一个 codeTimeout
+        # 周期收一枚“新的”验证码，两轮都不成就放弃这个账号。
+        tried: list[str] = []
+        otp_stage = ""
+        for attempt in (1, 2):
+            if attempt == 2:
+                # The provider's own "I need the next code" signal. Best effort:
+                # a rejected setStatus just means we keep polling as before.
+                if not client.release(mail_id, MAIL_STATUS_NEXT_CODE):
+                    logger.warning("[Codex] %s：请求下一封验证码被拒，继续按原节奏轮询", label)
+            logger.info(
+                "[Codex] %s：等待验证码（第 %d 轮，每 %.0fs 刷新，最长 %.0fs）",
+                label,
+                attempt,
+                code_interval,
+                code_timeout,
+            )
+            code = _wait_for_smsbower_code(
+                logger,
+                client,
+                mail_id,
+                timeout=code_timeout,
+                interval=code_interval,
+                exclude=tried,
+                label=label,
+                cancel_event=cancel_event,
+            )
+            if not code:
+                raise _register_failure(
+                    f"等待验证码超时（第 {attempt} 轮，{int(code_timeout)}s 内没有收到新的验证码）"
+                )
+            tried.append(code)
+            otp_result = _submit_login_step(
+                "submit_email_otp", label=label, step="提交邮箱验证码", logger=logger, code=code
+            )
+            error_text = str(otp_result.get("error_text") or "").strip()
+            if not error_text:
+                otp_stage = str(otp_result.get("next_stage") or "").strip().lower()
+                break
+            if attempt == 2:
+                raise _register_failure(f"验证码两轮都未通过：{error_text[:200]}")
+            logger.warning("[Codex] %s：验证码被拒（%s），继续等待新的验证码", label, error_text[:120])
+        if not otp_stage:
+            # The submit tore the frame down before the page could answer; the
+            # tab's own URL still knows where we ended up.
+            otp_stage = _wait_for_register_landing(logger, label)
+        logger.info("[Codex] %s：验证码通过，进入阶段：%s", label, otp_stage or "unknown")
+
+        if otp_stage == "about-you":
+            full_name, age = _generate_about_you_profile()
+            logger.info("[Codex] %s：填写 /about-you（%s / %s 岁）", label, full_name, age)
+            notices.push(f"正在填写 about-you（{full_name} / {age} 岁）…", scope="signup")
+            about_result = _submit_login_step(
+                "submit_about_you",
+                label=label,
+                step="填写 about-you",
+                logger=logger,
+                full_name=full_name,
+                age=age,
+            )
+            about_error = str(about_result.get("error_text") or "").strip()
+            if about_error:
+                raise _register_failure(f"填写 about-you 失败：{about_error[:200]}")
+
+        session = _confirm_logged_in(logger, label=label)
+        if session is None:
+            raise _register_failure("注册流程走完，但 chatgpt.com 仍未处于登录状态")
+
+        release_status = MAIL_STATUS_FINISH
+        # 注册完成后 chatgpt.com 会弹一个原生 <dialog>（"You're all set"），showModal()
+        # 会 inert 掉整页。必须先点掉，否则后面探 Plus 资格和开 MFA 的点击全部点空。
+        # 它在 load 之后才画出来，所以要**等**：不等的话这里查不到，白白放过去。
+        _dismiss_blocking_dialog(logger, label=label, wait_ms=8000)
+        # 账号已经建成了，Plus 免费资格只是附加属性：这一步无论成败都不能把
+        # 一个注册成功的账号判失败。
+        notices.push("正在检查 Plus 免费资格…", scope="signup")
+        plus_trial = _probe_plus_trial(logger, label=label)
+        store.update_registration(
+            email,
+            status="registered",
+            password=password,
+            plus_trial=plus_trial,
+            message=(
+                "已注册并登录，等待开启 2FA"
+                + ("；有 1 个月 Plus 免费资格" if plus_trial else "；无 Plus 免费资格")
+            ),
+        )
+        logger.info(
+            "[Codex] %s：%s 注册完成并已登录（Plus 免费资格：%s）",
+            label,
+            email,
+            "有" if plus_trial else "无",
+        )
+
+        # 需求步骤 7-9：开启验证器 App，取回 Base32 密钥。
+        # 账号此时已经建成、租用的号也已 setStatus=3 结清，所以 MFA 失败**不能**
+        # 把整单判失败——那会让一个可用账号显示成"注册失败"。失败就记成"已注册但
+        # 未开 2FA"，用户可以事后手动补。
+        _raise_if_stopped(cancel_event)
+        totp_secret = ""
+        mfa_error = ""
+        saved_secret = ""
+        notices.push("正在开启 2FA（验证器 App）…", scope="mfa")
+        try:
+            # on_secret：密钥一读到就写库，不等验证码提交的结果。OpenAI 只显示这
+            # 一次，押在后续步骤上就等于赌一把——赌输了账号的 2FA 已经开了却没有
+            # 密钥，账号直接废掉（真出过一次）。
+            def _persist_secret(value: str) -> None:
+                nonlocal saved_secret
+                saved_secret = value
+                store.update_registration(
+                    email,
+                    status="registered",
+                    password=password,
+                    totp_secret=value,
+                    message="已取得 2FA 密钥（等待验证码提交确认）",
+                )
+
+            totp_secret = _run_mfa_enrollment(
+                logger,
+                label=label,
+                password=password,
+                on_secret=_persist_secret,
+                cancel_event=cancel_event,
+            )
+        except _RegisterStopped:
+            raise
+        except Exception as exc:
+            mfa_error = str(exc)
+            logger.warning("[Codex] %s：开启 2FA 失败（账号本身已注册成功）：%s", label, mfa_error[:240])
+
+        plus_note = "；有 1 个月 Plus 免费资格" if plus_trial else "；无 Plus 免费资格"
+        if totp_secret:
+            # 密码 + 密钥都齐了：update_registration 会把记录改写成 password_totp，
+            # 素材变成 email----密码----密钥（导出时再追加 ----0/1）。
+            store.update_registration(
+                email,
+                status="success",
+                password=password,
+                totp_secret=totp_secret,
+                message="已注册并开启 2FA" + plus_note,
+            )
+            message = "账号已注册并开启 2FA" + plus_note
+        else:
+            # 即便验证码那步失败，只要密钥已经拿到就一定要保留：OpenAI 只显示一次，
+            # 丢了就再也找不回来（这条是踩过坑之后加的）。
+            if saved_secret:
+                store.update_registration(
+                    email,
+                    status="registered",
+                    message=f"已取得 2FA 密钥但未确认开启：{mfa_error[:180]}" + plus_note,
+                )
+                message = f"账号已注册，2FA 密钥已保存但未确认开启：{mfa_error[:100]}" + plus_note
+            else:
+                store.update_registration(
+                    email,
+                    status="registered",
+                    message=f"已注册但未开启 2FA：{mfa_error[:200]}" + plus_note,
+                )
+                message = f"账号已注册（2FA 未开启：{mfa_error[:120]}）" + plus_note
+        logger.info("[Codex] %s：%s %s", label, email, message)
+        return codex_oauth._codex_result(
+            status="success",
+            ok=True,
+            email=email,
+            message=message,
+        )
+    except _RegisterStopped:
+        # 用户按了停止：账号没建成，租用的号必须退回（release_status 仍是 CANCEL）。
+        # 不当作失败写 register_status=failed，否则清单里会留下一条误导的"注册失败"。
+        message = "用户已停止流水线，注册中断"
+        store.update_registration(email, status="pending", message=message)
+        logger.info("[Codex] %s：%s", label, message)
+        return codex_oauth._codex_result(
+            status="stopped",
+            ok=False,
+            email=email,
+            message=message,
+        )
+    except Exception as exc:
+        store.update_registration(email, status="failed", message=str(exc)[:300])
+        # 这一轮的租用号在下面的 finally 里会被 setStatus=2 退回，**同一个账号再重试
+        # 一次必然在取码那步撞 ActivationGone**。所以逃出去的错误必须带上
+        # register_failed 令牌，让调度器判成不可重试——否则文案里只要恰好带个"超时"
+        # 就会被当成 transient_network 重试，白跑一轮。已有的终局令牌保持原样
+        # （它们本来就是不可重试的分类，还各自带着更准确的语义）。
+        message = str(exc)
+        terminal = (
+            _REGISTER_FAILED_TOKEN,
+            _ACCOUNT_EXISTS_TOKEN,
+            _RISK_BLOCK_TOKEN,
+            "account_deactivated",
+        )
+        if not any(token in message for token in terminal):
+            raise _register_failure(message[:300]) from exc
+        raise
+    finally:
+        # Always settle the rental: 3 closes it and pays, 2 hands it back. A
+        # provider failure here must not change the account's outcome.
+        # **结果一定要写进日志**：租用号一直开着就一直计费，事后翻日志必须能一眼
+        # 看出"这个号到底退没退"，而不是靠"代码里有 release"想当然（见下面注释）。
+        _settle_rental(logger, client, mail_id, release_status, label=label)
+
+
+# setStatus 的两个终态，写成中文只为日志好读。
+_RENTAL_STATUS_NAMES = {2: "取消并退回", 3: "完成并结清"}
+
+
+def _settle_rental(logger, client, mail_id: int, status: int, *, label: str = "注册") -> bool:
+    """给 smsbower 活动收尾（setStatus），**并把结果如实写进日志**。
+
+    失败不抛异常：账号的成败此刻已经定了，供应商抽风不该把一次成功的注册变成报错。
+    但"没退成"必须显式喊出来——号还开着就一直扣钱，只有日志能告诉用户去后台补刀。
+    """
+
+    from .smsbower_mail import SmsbowerMailActivationGoneError, SmsbowerMailError
+
+    name = _RENTAL_STATUS_NAMES.get(int(status), str(status))
+    try:
+        client.set_status(mail_id, status)
+    except SmsbowerMailActivationGoneError as exc:
+        # 已经取消过/已经结清/id 不存在：这也是"不再计费"，不是问题。
+        logger.info(
+            "[Codex] %s：smsbower 结算 mail_id=%s setStatus=%s（%s）：该活动已不存在，视为已结清（%s）",
+            label,
+            mail_id,
+            status,
+            name,
+            str(exc)[:120],
+        )
+        return True
+    except SmsbowerMailError as exc:
+        logger.warning(
+            "[Codex] %s：smsbower 结算失败 mail_id=%s setStatus=%s（%s）：%s"
+            "——该邮箱可能仍在计费，请到 smsbower 后台手动关闭",
+            label,
+            mail_id,
+            status,
+            name,
+            str(exc)[:160],
+        )
+        notices.push(
+            f"smsbower 邮箱 {mail_id} 未能{name}，可能仍在计费，请到后台确认", level="warn", scope="signup"
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001
+        # 它跑在 finally 里：结算自己出问题绝不能盖掉账号的真实结果（成功还是成功，
+        # 失败还是那个失败的原因），只如实记一笔。
+        logger.warning(
+            "[Codex] %s：smsbower 结算调用异常 mail_id=%s setStatus=%s（%s）：%s"
+            "——该邮箱可能仍在计费，请到 smsbower 后台手动关闭",
+            label,
+            mail_id,
+            status,
+            name,
+            f"{type(exc).__name__}: {exc}"[:160],
+        )
+        return False
+    logger.info(
+        "[Codex] %s：smsbower 结算成功 mail_id=%s setStatus=%s（%s）", label, mail_id, status, name
+    )
+    return True
 
 
 _GCASH_TOKEN_URL = "https://chatgpt.com/api/auth/session"
@@ -1225,9 +3082,10 @@ def _run_codex_in_browser(settings: Settings, mailbox: dict, *, otp_provider, pa
     # carries the previous account's cookies/session/consent into the next
     # (root cause of /choose-an-account and "consent verifier already used").
     logger.info("[Codex] 账号开始前清理浏览器（Cookies/会话/缓存/存储），保持隐私模式")
+    _bridge_apply_proxy(mailbox, label="OAuth")
     _bridge_cleanup()
     _bridge_navigate("https://chatgpt.com/login")
-    _bridge_navigate("https://auth.openai.com/log-in")
+    _bridge_navigate(_OPENAI_LOGIN_URL)
     _bridge_navigate(auth_url)
     time.sleep(1.0)
 
@@ -1598,6 +3456,38 @@ def _run_codex_in_browser(settings: Settings, mailbox: dict, *, otp_provider, pa
     )
 
 
+def _settle_mailbox_rental(settings: Settings, mailbox: dict, *, status: int = 0, reason: str = "", label: str = "注册") -> bool:
+    """在 `_run_account_signup` 之外退回一个已租用的邮箱（默认 setStatus=2 取消）。
+
+    `_run_account_signup` 自己的 finally 覆盖了流程内的所有出口；这里管的是**还没
+    进到那个函数就失败**的情况（例如浏览器桥没连上）——号已经租下来了，不退就一直
+    计费，而且日志里连一行记录都不会有。
+    """
+
+    from .smsbower_mail import MAIL_STATUS_CANCEL
+
+    logger = logging.getLogger(__name__)
+    try:
+        mail_id = int(str(mailbox.get("mail_id") or "").strip())
+    except ValueError:
+        mail_id = 0
+    if mail_id <= 0:
+        return False
+    if reason:
+        logger.info("[Codex] %s：%s，正在退回 smsbower 邮箱 mail_id=%s", label, reason, mail_id)
+    try:
+        client, _config = _smsbower_mail_runtime(settings)
+    except Exception as exc:
+        logger.warning(
+            "[Codex] %s：smsbower 客户端不可用，mail_id=%s 无法退回，可能仍在计费：%s",
+            label,
+            mail_id,
+            str(exc)[:160],
+        )
+        return False
+    return _settle_rental(logger, client, mail_id, status or MAIL_STATUS_CANCEL, label=label)
+
+
 def run_codex_only(settings: Settings, mailbox: dict, *, cancel_event=None) -> dict:
     """Run only the upstream existing-account Codex OAuth entrypoint.
 
@@ -1616,8 +3506,22 @@ def run_codex_only(settings: Settings, mailbox: dict, *, cancel_event=None) -> d
     login_only = bool(mailbox.get("login_only"))
     # "gcash 提炼" mode: login → accessToken → 153 提炼 → 付款链接 → 等待扫码.
     gcash_extract = bool(mailbox.get("gcash_extract"))
+    # "smsbower-gmail 注册" mode: create the account behind a rented address.
+    register_account = bool(mailbox.get("register_account"))
     source = str(mailbox.get("source") or "").strip().lower()
     codex_oauth = _ensure_upstream_imports(settings)
+
+    if register_account:
+        # Its own entrypoint: there is no account to log into yet, so none of the
+        # OTP providers below apply — the code comes from the mailbox rental.
+        if not _browser_flow_available():
+            # 一步都没用上这个号：立刻退回，否则它会一直计费而日志里连一行都没有。
+            _settle_mailbox_rental(settings, mailbox, reason="浏览器桥未连接，注册无法开始")
+            raise _register_failure("注册需要浏览器桥（要在活动页完成建号），当前未连接")
+        logging.getLogger(__name__).info(
+            "[Codex] 浏览器桥已连接，进入 smsbower-gmail 注册模式（不接码短信/不走 OAuth）"
+        )
+        return _run_account_signup(settings, mailbox, cancel_event=cancel_event)
 
     password = ""
     totp_provider = None

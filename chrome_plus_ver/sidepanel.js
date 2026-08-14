@@ -9,7 +9,13 @@ let bridgeWindowId=null;
 async function ensureBridgeWindowId(){if(bridgeWindowId!==null)return bridgeWindowId;try{if(globalThis.chrome&&chrome.windows&&chrome.windows.getCurrent){const w=await chrome.windows.getCurrent();if(w&&typeof w.id==='number')bridgeWindowId=w.id}}catch(e){}return bridgeWindowId}
 async function runtimeMessage(type,payload={},timeoutMs=8000){if(!(globalThis.chrome&&chrome.runtime&&chrome.runtime.sendMessage))throw new Error('当前页面未运行在 Chrome 扩展侧边栏环境中');const windowId=await ensureBridgeWindowId();return Promise.race([chrome.runtime.sendMessage({type,windowId,...payload}),new Promise((_,reject)=>setTimeout(()=>reject(new Error('扩展后台响应超时')),timeoutMs))])}
 async function api(url,opts={}){const headers={...(opts.headers||{})};if(opts.body!==undefined&&headers['Content-Type']===undefined)headers['Content-Type']='application/json';const r=await fetch(backendUrl(url),{...opts,headers});const j=await r.json().catch(()=>({}));if(!r.ok||j.ok===false)throw new Error(j.error||`HTTP ${r.status}`);return j}
-function toast(msg){const e=$('#toast');e.textContent=msg;e.style.display='block';clearTimeout(window.__t);window.__t=setTimeout(()=>e.style.display='none',4000)}
+function toast(msg,ms=4000){const e=$('#toast');e.textContent=msg;e.classList.remove('fading');e.style.display='block';clearTimeout(window.__t);clearTimeout(window.__tf);window.__tf=setTimeout(()=>e.classList.add('fading'),Math.max(0,ms-400));window.__t=setTimeout(()=>{e.style.display='none';e.classList.remove('fading')},ms)}
+// 后端流水线的即时提示（取码轮询等静默阶段）。游标从 -1 开始：第一次只取当前
+// 位置、不补历史，否则一打开侧边栏就会弹一串过期提示。
+let noticeCursor=-1;
+async function pollNotices(){try{const j=await api(`/api/notices?after=${noticeCursor}`);const items=Array.isArray(j.notices)?j.notices:[];noticeCursor=Number.isFinite(j.seq)?j.seq:noticeCursor;
+// 一次刷新里可能积压多条（面板被切走过），只弹最后一条，避免刷屏。
+if(items.length)toast(items[items.length-1].message,3000)}catch(e){/* 提示是尽力而为，拉不到就算了 */}}
 function saveBackendOrigin(value){const normalized=String(value||'').trim().replace(/\/+$/,'');if(normalized)localStorage.setItem('codex_backend_origin',normalized)}
 function loadBackendOrigin(){const saved=String(localStorage.getItem('codex_backend_origin')||'').trim().replace(/\/+$/,'');if(saved)extensionState.backendOrigin=saved}
 async function loadExtensionBootstrap(){loadBackendOrigin();const bootstrap=await api('/api/extension/bootstrap');if(bootstrap&&bootstrap.backend_origin){extensionState.backendOrigin=String(bootstrap.backend_origin).replace(/\/+$/,'');saveBackendOrigin(extensionState.backendOrigin)}if(Array.isArray(bootstrap&&bootstrap.cleanup_origins)&&bootstrap.cleanup_origins.length)extensionState.cleanupOrigins=bootstrap.cleanup_origins.map(value=>String(value||'').trim()).filter(Boolean)}
@@ -23,7 +29,7 @@ function inferDownloadName(response,fallback='download.bin'){const disposition=S
 async function saveBlobToBackend(blob,filename,mimeType='application/octet-stream'){const contentBase64=await blobToBase64(blob);const result=await api('/api/extension/files/save',{method:'POST',body:JSON.stringify({filename,mime_type:mimeType,content_base64:contentBase64})});return result.file||{}}
 async function saveRemoteFile(url,{method='GET',headers={},body,filename='download.bin'}={}){const response=await fetch(backendUrl(url),{method,headers,body});if(!response.ok){const result=await response.json().catch(()=>({}));throw new Error(result.error||`HTTP ${response.status}`)}const blob=await response.blob();const saved=await saveBlobToBackend(blob,inferDownloadName(response,filename),response.headers.get('Content-Type')||blob.type||'application/octet-stream');toast(`文件已保存到后端：${saved.name||filename}`);return saved}
 async function runBrowserCleanup(reason,{quiet=false}={}){if(extensionState.cleanupInFlight)return extensionState.cleanupInFlight;extensionState.cleanupInFlight=runtimeMessage('cleanup-browser-state',{origins:extensionState.cleanupOrigins,reason:String(reason||'')}).then(result=>{if(!result||result.ok===false)throw new Error(result&&result.error||'浏览器状态清理失败');if(!quiet)toast('已清理浏览器缓存、会话与 Cookies');return result}).finally(()=>{extensionState.cleanupInFlight=null});return extensionState.cleanupInFlight}
-async function trackCompletedJobs(rows){const nextStatuses=new Map();const completed=[];(Array.isArray(rows)?rows:[]).forEach(job=>{const id=String(job&&job.id||'');const status=String(job&&job.status||'').toLowerCase();if(!id)return;const previous=extensionState.jobStatuses.get(id);if(previous&&ACTIVE_JOB_STATUSES.has(previous)&&TERMINAL_JOB_STATUSES.has(status)&&!extensionState.cleanedJobs.has(id)){completed.push(job);extensionState.cleanedJobs.add(id)}nextStatuses.set(id,status)});extensionState.jobStatuses=nextStatuses;if(completed.length){const mode=String(pipelineState&&pipelineState.mode||'');if(mode==='login'||mode==='gcash'){/* 仅登录 / gcash 提炼：收尾清理会清掉刚拿到的登录态并把标签页停到 about:blank（gcash 还会打断绑定的标签页），必须跳过 */return}try{await runBrowserCleanup('任务完成后清理浏览器环境',{quiet:true})}catch(error){console.warn('post-job cleanup failed',error)}}}
+async function trackCompletedJobs(rows){const nextStatuses=new Map();const completed=[];(Array.isArray(rows)?rows:[]).forEach(job=>{const id=String(job&&job.id||'');const status=String(job&&job.status||'').toLowerCase();if(!id)return;const previous=extensionState.jobStatuses.get(id);if(previous&&ACTIVE_JOB_STATUSES.has(previous)&&TERMINAL_JOB_STATUSES.has(status)&&!extensionState.cleanedJobs.has(id)){completed.push(job);extensionState.cleanedJobs.add(id)}nextStatuses.set(id,status)});extensionState.jobStatuses=nextStatuses;if(completed.length){const mode=String(pipelineState&&pipelineState.mode||'');if(mode==='login'||mode==='gcash'||mode==='register'){/* 仅登录 / gcash 提炼 / 注册：收尾清理会清掉刚拿到的登录态并把标签页停到 about:blank（gcash 还会打断绑定的标签页），必须跳过。注册后要保留登录态给第三段开 2FA */return}try{await runBrowserCleanup('任务完成后清理浏览器环境',{quiet:true})}catch(error){console.warn('post-job cleanup failed',error)}}}
 const labels={idle:'尚未启动',pending:'待处理',queued:'排队中',running:'运行中',paused:'已暂停',retry_wait:'等待重试',stopping:'停止中',success:'成功',completed:'已完成',failed:'失败',interrupted:'已中断',stopped:'已停止',deactivated:'账号不可用',skipped:'已跳过'};
   let heroCredentialConfigured=false,heroConfigPersistedReady=false;
   let smsbowerCredentialConfigured=false;
@@ -51,6 +57,10 @@ function accountIsRunnable(account){return !!(account&&account.otp_ready&&!accou
 // accountIsRunnable so they don't sweep in already-successful accounts.
 function accountIsManuallyRunnable(account){return !!(account&&account.otp_ready&&!accountIsActive(account))}
 function accountMatchesScope(account,scope=$('#pipelineScope').value){if(!accountIsRunnable(account))return false;if(scope==='failed')return accountIsFailed(account);if(scope==='pending')return !accountIsFailed(account);return scope==='runnable'}
+// smsbower-gmail 取号得到的地址：还没建号所以 otp_ready 恒为 false，走独立判据。
+// register_status==='registered' 说明账号已建好（会被改写成 password_totp），不再重复注册。
+function accountIsRegisterRunnable(account){return !!(account&&String(account.source||'').toLowerCase()==='smsbower_gmail'&&String(account.register_status||'').toLowerCase()!=='registered'&&String(account.mail_id||'').trim()&&!accountIsActive(account))}
+function registerRunnableAccounts(scope=$('#pipelineScope').value){return(scope==='selected'?selectedAccounts():accountRows).filter(accountIsRegisterRunnable)}
 function accountMatchesFilter(account,filter=$('#accountFilter').value){const status=accountStatus(account);if(filter==='pending')return accountIsRunnable(account)&&!accountIsFailed(account);if(filter==='active')return accountIsActive(account);if(filter==='success')return accountHasCredential(account)||status==='success';if(filter==='failed')return accountIsFailed(account)||status==='deactivated';return true}
 function selectedAccounts(){return accountRows.filter(account=>selectedAccountIds.has(String(account.id)))}
 // The accounts currently shown by the 筛选 + 搜索 controls — the scope the
@@ -73,13 +83,25 @@ function pipelineIsActive(pipeline=pipelineState){return !!(pipeline&&(pipeline.
 function renderOnboarding(){}
 function focusWorkflowAction(action){if(action==='sms'){switchWorkspace('sms');setTimeout(()=>{const target=$('.hero-flow');target&&target.scrollIntoView({behavior:'smooth',block:'start'});const input=heroCredentialConfigured?$('#heroCountrySearch'):$('#smsCredential');input&&input.focus({preventScroll:true})},80);return}if(action==='results'){switchWorkspace('results');return}switchWorkspace('accounts');const selector=action==='pipeline'?'#pipelineCard':action==='accounts'?'#accounts':'#importPanel',target=$(selector);if(action==='import'&&target)target.open=true;setTimeout(()=>{target&&target.scrollIntoView({behavior:'smooth',block:'start'});if(action==='import')$('#materials').focus({preventScroll:true});if(action==='pipeline')$('#startPipeline').focus({preventScroll:true})},50)}
 function importMaterialLines(){return $('#materials').value.split(/\r?\n/).map(line=>line.trim()).filter(Boolean)}
-function updateImportHelper(){const source=$('#source').value,generic=source==='generic_api',codeUrl=source==='code_url',passwordTotp=source==='password_totp',lines=importMaterialLines(),format=passwordTotp?'email----密码----2FA密钥':generic?'email----API_KEY':codeUrl?'email----https://example.com/code':'email----邮箱密码----clientId----refreshToken';$('#importFormatExample').textContent=format;$('#importSourceHint').textContent=passwordTotp?'适用于已启用验证器 2FA 的现有 ChatGPT 账号。分隔符 ---- 与 | 都支持，密钥后面可以再跟备注等其他字段（自动忽略）。第二列是 ChatGPT/OpenAI 登录密码，不是 iCloud 等邮箱的密码；动态验证码在本机生成，不读取邮箱。':generic?'iCloud 接码凭证会自动转换为 HTTPS 查询地址，API Key 仅保存在本机。':codeUrl?'后台会定时 GET 该 URL，直接从 HTML、JSON、纯文本或受支持的网页收件箱中提取 6 位验证码。取码 URL 仅保存在本机。':'适用于 Outlook / Hotmail，使用 Microsoft Graph 读取验证码。';$('#materials').placeholder=passwordTotp?'一行一个已有账号\nname@example.com----ChatGPT密码----Base32密钥\nname@example.com----ChatGPT密码----Base32密钥----其他字段（可选）':generic?'一行一个已有账号\nname@example.com----你的API_KEY':codeUrl?'一行一个已有账号\nname@example.com----https://example.com/code':'一行一个已有账号\nname@example.com----邮箱密码----clientId----refreshToken';$('#importLineCount').textContent=lines.length?`已识别 ${lines.length} 行素材`:'尚未粘贴账号';$('#importAccounts').disabled=!lines.length;$('#importAccounts').textContent=lines.length?`导入 ${lines.length} 行账号`:'导入账号';$('#importFeedback').hidden=true}
-function switchWorkspace(view){currentView=['accounts','sms','results','logs','debug'].includes(view)?view:'accounts';document.querySelectorAll('[data-workspace]').forEach(element=>element.hidden=element.dataset.workspace!==currentView);document.querySelectorAll('[data-view]').forEach(button=>{const active=button.dataset.view===currentView;button.classList.toggle('active',active);if(active)button.setAttribute('aria-current','page');else button.removeAttribute('aria-current')});const visible=Array.from($('#topGrid').children).filter(element=>!element.hidden);$('#topGrid').hidden=!visible.length;$('#topGrid').classList.toggle('single',visible.length===1);renderJobs(jobRows);if(currentView==='results'){pauseTimelineRefresh();loadArtifacts();loadSmsStats()}else if(currentView==='logs'){loadArtifacts();loadLogTimeline({reset:true,silent:!!timelineData})}else if(currentView==='debug'){pauseTimelineRefresh();loadDebugTabs();if(!gcashTabsLoaded)loadGcashTabs()}else pauseTimelineRefresh()}
+// smsbower-gmail 没有可粘贴的素材：地址是调接口租来的，所以这一类把「账号素材」
+// 输入区整块换成接口参数 + 取号数量。
+const SMSBOWER_GMAIL='smsbower_gmail';
+let smsbowerMailConfigured=false;
+function importIsSmsbowerGmail(){return $('#source').value===SMSBOWER_GMAIL}
+// 取号+注册是一条流水线（后端一个一个租号、注册完再租下一个），所以按钮
+// 和「批量处理账号」共用同一把锁：流水线在跑就不能再启动一轮。
+function syncSmsbowerImportButton(){if(!importIsSmsbowerGmail())return;const button=$('#importAccounts'),active=pipelineIsActive();button.disabled=!smsbowerMailConfigured||active;button.textContent=!smsbowerMailConfigured?'请先保存 API Key':active?'流水线运行中':`取号并注册 ${smsbowerMailCount()} 个账号`}
+function smsbowerMailCount(){return Math.max(1,Math.floor(Number($('#smsbowerMailCount').value)||1))}
+function updateImportHelper(){const source=$('#source').value,smsbower=source===SMSBOWER_GMAIL,generic=source==='generic_api',codeUrl=source==='code_url',passwordTotp=source==='password_totp',lines=importMaterialLines(),format=smsbower?'接口取号，无需粘贴素材':passwordTotp?'email----密码----2FA密钥':generic?'email----API_KEY':codeUrl?'email----https://example.com/code':'email----邮箱密码----clientId----refreshToken';$('#importFormatExample').textContent=format;$('#importSourceHint').textContent=smsbower?'通过 smsbower 邮箱接口按量租用 gmail 地址（service=dr、domain=gmail.com）。点下面的按钮后会「取 1 个号 → 立刻注册它（建号、设密码、过邮箱验证码、开启 2FA）→ 再取下一个」，直到跑满设定的数量；注册成功的账号自动转成「密码 + TOTP 2FA」素材。API Key 仅保存在本机。':passwordTotp?'适用于已启用验证器 2FA 的现有 ChatGPT 账号。分隔符 ---- 与 | 都支持，密钥后面可以再跟备注等其他字段（自动忽略）。第二列是 ChatGPT/OpenAI 登录密码，不是 iCloud 等邮箱的密码；动态验证码在本机生成，不读取邮箱。':generic?'iCloud 接码凭证会自动转换为 HTTPS 查询地址，API Key 仅保存在本机。':codeUrl?'后台会定时 GET 该 URL，直接从 HTML、JSON、纯文本或受支持的网页收件箱中提取 6 位验证码。取码 URL 仅保存在本机。':'适用于 Outlook / Hotmail，使用 Microsoft Graph 读取验证码。';['#materialsLabel','#materials','#importInputMeta'].forEach(selector=>{$(selector).hidden=smsbower});$('#smsbowerGmailForm').hidden=!smsbower;$('#importLocalNote').textContent=smsbower?'会通过接口新建 ChatGPT 账号':'不会创建或注册新账号';$('#materials').placeholder=passwordTotp?'一行一个已有账号\nname@example.com----ChatGPT密码----Base32密钥\nname@example.com----ChatGPT密码----Base32密钥----其他字段（可选）':generic?'一行一个已有账号\nname@icloud.com----你的API_KEY':codeUrl?'一行一个已有账号\nname@example.com----https://example.com/code':'一行一个已有账号\nname@example.com----邮箱密码----clientId----refreshToken';if(smsbower){syncSmsbowerImportButton();$('#importFeedback').hidden=true;return}$('#importLineCount').textContent=lines.length?`已识别 ${lines.length} 行素材`:'尚未粘贴账号';$('#importAccounts').disabled=!lines.length;$('#importAccounts').textContent=lines.length?`导入 ${lines.length} 行账号`:'导入账号';$('#importFeedback').hidden=true}
+async function loadSmsbowerMailConfig(){const state=$('#smsbowerMailState');try{const j=await api('/api/smsbower-mail-config'),config=j.config||{};smsbowerMailConfigured=!!config.api_key_configured;$('#smsbowerMailKey').value='';$('#smsbowerMailKey').placeholder=smsbowerMailConfigured?`已保存 ${config.api_key_masked||''}，留空表示不修改`:'请填写 smsbower 邮箱 API Key';$('#smsbowerMailMaxPrice').value=config.max_price||'';$('#smsbowerMailCodeTimeout').value=config.code_timeout_seconds||120;$('#smsbowerMailCodeInterval').value=config.code_interval_seconds||5;$('#smsbowerMailSupplyRetry').value=config.supply_retry_seconds||10;$('#smsbowerMailNextAccountInterval').value=config.next_account_interval_seconds??60;state.className='smsbower-mail-state';state.textContent=smsbowerMailConfigured?`service=${config.service} · domain=${config.domain}；验证码每 ${config.code_interval_seconds}s 刷新一次，最长等待 ${config.code_timeout_seconds}s；取号失败每 ${config.supply_retry_seconds}s 重试；账号收尾后 ${config.next_account_interval_seconds??60}s 处理下一个。${config.max_price?`每个邮箱最高 ${config.max_price}。`:'未设置价格上限。'}`:'尚未保存 API Key，保存后才能取号。'}catch(e){smsbowerMailConfigured=false;state.className='smsbower-mail-state warn';state.textContent='读取配置失败：'+e.message}updateImportHelper()}
+async function saveSmsbowerMailConfig(){const button=$('#saveSmsbowerMailConfig'),state=$('#smsbowerMailState');button.disabled=true;try{await api('/api/smsbower-mail-config',{method:'POST',body:JSON.stringify({api_key:$('#smsbowerMailKey').value.trim(),max_price:$('#smsbowerMailMaxPrice').value.trim(),code_timeout_seconds:$('#smsbowerMailCodeTimeout').value,code_interval_seconds:$('#smsbowerMailCodeInterval').value,supply_retry_seconds:$('#smsbowerMailSupplyRetry').value,next_account_interval_seconds:$('#smsbowerMailNextAccountInterval').value})});toast('smsbower 邮箱配置已保存');await loadSmsbowerMailConfig()}catch(e){state.className='smsbower-mail-state warn';state.textContent='保存失败：'+e.message;toast(e.message)}finally{button.disabled=false}}
+async function exportAccounts(){const scoped=selectedAccounts();if(!scoped.length){toast('请先勾选要导出的账号');return}if(scoped.length>500){toast('每次最多导出 500 个账号');return}if(!confirm(`将按各自的导入素材类型导出已勾选的 ${scoped.length} 个账号的登录素材，其中包含密码、密钥或取码地址。确定继续？`))return;const button=$('#exportAccounts');button.disabled=true;try{await triggerJsonDownload('/api/accounts/selected/export',{account_ids:scoped.map(account=>String(account.id)),confirmed:true},'account-materials-original-format.zip');toast(`已导出 ${scoped.length} 个账号的原格式素材`)}catch(e){toast('账号导出失败：'+e.message)}finally{button.disabled=false}}
+function switchWorkspace(view){currentView=['accounts','sms','proxy','results','logs','debug'].includes(view)?view:'accounts';document.querySelectorAll('[data-workspace]').forEach(element=>element.hidden=element.dataset.workspace!==currentView);document.querySelectorAll('[data-view]').forEach(button=>{const active=button.dataset.view===currentView;button.classList.toggle('active',active);if(active)button.setAttribute('aria-current','page');else button.removeAttribute('aria-current')});const visible=Array.from($('#topGrid').children).filter(element=>!element.hidden);$('#topGrid').hidden=!visible.length;$('#topGrid').classList.toggle('single',visible.length===1);renderJobs(jobRows);if(currentView==='results'){pauseTimelineRefresh();loadArtifacts();loadSmsStats()}else if(currentView==='logs'){loadArtifacts();loadLogTimeline({reset:true,silent:!!timelineData})}else if(currentView==='debug'){pauseTimelineRefresh();loadDebugTabs();loadBrowserConfig();loadFingerprint();if(!gcashTabsLoaded)loadGcashTabs()}else if(currentView==='proxy'){pauseTimelineRefresh();loadProxies()}else pauseTimelineRefresh()}
 function selectScopeAccounts(scope=$('#pipelineScope').value){selectedAccountIds.clear();if(scope!=='selected')accountRows.filter(account=>accountMatchesScope(account,scope)).forEach(account=>selectedAccountIds.add(String(account.id)));renderAccounts();renderPipeline(pipelineState)}
 function syncDefaultSelection(){const liveIds=new Set(accountRows.map(account=>String(account.id)));Array.from(selectedAccountIds).forEach(id=>{if(!liveIds.has(id))selectedAccountIds.delete(id)});const scope=$('#pipelineScope').value;accountRows.forEach(account=>{const id=String(account.id);if(!seenAccountIds.has(id)&&scope!=='selected'&&accountMatchesScope(account,scope))selectedAccountIds.add(id);seenAccountIds.add(id)})}
 function pipelinePercent(pipeline){if(!pipeline)return 0;let value=Number(pipeline.progress);if(!Number.isFinite(value)&&Number(pipeline.total)>0)value=Number(pipeline.completed||0)/Number(pipeline.total)*100;return Math.max(0,Math.min(100,Number.isFinite(value)?value:0))}
 function countValue(counts,...keys){for(const key of keys){const value=Number(counts&&counts[key]);if(Number.isFinite(value))return value}return 0}
-function renderPipeline(pipeline=pipelineState){pipelineState=pipeline&&typeof pipeline==='object'?pipeline:null;const active=pipelineIsActive(),status=String(pipelineState&&pipelineState.status||'idle').toLowerCase(),paused=status==='paused',stopping=status==='stopping',scope=$('#pipelineScope').value,runnable=pipelineRunnableAccounts(scope),manualScope=scope==='selected',badge=$('#pipelineStateBadge'),counts=pipelineState&&pipelineState.counts||{},percent=pipelinePercent(pipelineState),scopeText=$('#pipelineScope').selectedOptions[0]&&$('#pipelineScope').selectedOptions[0].textContent||'待处理账号',concurrency=Math.max(1,Math.min(1,Number($('#pipelineConcurrency').value)||1)),retryLimit=Math.max(0,Math.min(99,Number($('#pipelineRetryLimit').value)||0));badge.className=`pipeline-state ${esc(status)}`;badge.innerHTML=`<span class="dot"></span>${esc(labels[status]||status||'尚未启动')}`;if(active&&pipelineState&&pipelineState.id){$('#pipelineConcurrency').value=String(Math.max(1,Math.min(1,Number(pipelineState.concurrency)||1)));$('#pipelineRetryLimit').value=String(Math.max(0,Math.min(99,Number(pipelineState.retry_limit)||0)))}const total=Number(pipelineState&&pipelineState.total)||0,completed=Number(pipelineState&&pipelineState.completed)||0;$('#pipelineProgress').hidden=!(pipelineState&&pipelineState.id);$('#pipelineProgressTitle').textContent=paused?`已暂停 ${completed} / ${total}`:active?`正在处理 ${completed} / ${total}`:pipelineState&&pipelineState.id?`上一批次：${labels[status]||status}`:'等待启动';$('#pipelineProgressMeta').textContent=paused?'已停止派发新任务；已运行任务会正常收尾':active?`串行处理 1 个账号 · 失败最多重试 ${pipelineState.retry_limit||0} 次`:manualScope?`已手动选择 ${runnable.length} 个可运行账号`:`当前范围内 ${runnable.length} 个可运行账号`;$('#pipelineProgressBar').style.width=`${percent}%`;$('#pipelineCounts').innerHTML=`<span>待处理 ${countValue(counts,'queued','pending')}</span><span>运行中 ${countValue(counts,'running','active')}</span><span>重试等待 ${countValue(counts,'retry_wait','retrying')}</span><span>成功 ${countValue(counts,'success','completed')}</span><span>失败 ${countValue(counts,'failed')}</span>`;$('#pipelineReadyTitle').textContent=paused?`流水线已暂停，已完成 ${completed} / ${total}`:active?`正在处理 ${completed} / ${total} 个账号`:runnable.length?(manualScope?`已选择 ${runnable.length} 个可处理账号`:`当前范围内 ${runnable.length} 个可处理账号`):!overviewLoaded?'正在计算可处理账号':!accountRows.length?'请先导入已有账号':!accountsAvailable?'请先完成接码配置':manualScope?'请先在表格中勾选账号':'当前范围内没有可处理账号';$('#pipelineSelectionHint').textContent=paused?'暂停不会中断正在进行的网络步骤；点击继续后会恢复排队。':active?'流水线正在自动领取后续任务；你可以暂停派发或停止尚未领取的任务。':runnable.length?'已有凭证、正在运行或邮箱取码未就绪的账号会自动跳过。':manualScope?'切换到“全部待处理账号”可自动纳入当前可运行账号。':'可在账号清单中查看每个账号无法运行的原因。';$('#pipelineSettingsSummary').textContent=`${scopeText} · 串行执行 · 失败重试 ${retryLimit} 次`;$('#startPipeline').disabled=active||!accountsAvailable||!runnable.length;$('#startPipeline').textContent=paused?'流水线已暂停':active?'流水线运行中':runnable.length?`开始处理 ${runnable.length} 个账号`:!accountsAvailable?'请先完成接码配置':manualScope?'请先勾选账号':'暂无可处理账号';const exportSessionBtn=$('#exportSessionPipeline');if(exportSessionBtn){exportSessionBtn.disabled=active||!accountsAvailable||!runnable.length;exportSessionBtn.hidden=active;exportSessionBtn.title=runnable.length?`登录后导出 Session（${runnable.length} 个账号）`:'暂无可处理账号';}const loginOnlyBtn=$('#loginOnlyPipeline');if(loginOnlyBtn){loginOnlyBtn.disabled=active||!accountsAvailable||runnable.length!==1;loginOnlyBtn.hidden=active;loginOnlyBtn.title=runnable.length===1?`仅登录 ${runnable[0].email}（不导出 Session、不走 OAuth）`:runnable.length?'仅登录一次只能选择 1 个账号':'暂无可处理账号';}const gcashBtn=$('#gcashPipeline');if(gcashBtn){const bound=gcashTabsReady();gcashBtn.disabled=active||!accountsAvailable||!runnable.length||!bound;gcashBtn.hidden=active;gcashBtn.title=!bound?'请先在「调试」页绑定「ChatGPT登录」和「153提炼」两个标签页并保存':runnable.length?`对 ${runnable.length} 个账号串行执行 gcash 提炼（每个账号都需要人工扫码）`:'暂无可处理账号';}$('#pausePipeline').hidden=!active||paused||stopping||!pipelineState.id;$('#resumePipeline').hidden=!paused||!pipelineState.id;$('#stopPipeline').hidden=!active||!pipelineState.id;$('#pipelineScope').disabled=active;$('#pipelineConcurrency').disabled=true;$('#pipelineRetryLimit').disabled=active;renderOnboarding()}
+function renderPipeline(pipeline=pipelineState){pipelineState=pipeline&&typeof pipeline==='object'?pipeline:null;const active=pipelineIsActive(),status=String(pipelineState&&pipelineState.status||'idle').toLowerCase(),paused=status==='paused',stopping=status==='stopping',scope=$('#pipelineScope').value,runnable=pipelineRunnableAccounts(scope),manualScope=scope==='selected',badge=$('#pipelineStateBadge'),counts=pipelineState&&pipelineState.counts||{},percent=pipelinePercent(pipelineState),scopeText=$('#pipelineScope').selectedOptions[0]&&$('#pipelineScope').selectedOptions[0].textContent||'待处理账号',concurrency=Math.max(1,Math.min(1,Number($('#pipelineConcurrency').value)||1)),retryLimit=Math.max(0,Math.min(99,Number($('#pipelineRetryLimit').value)||0));badge.className=`pipeline-state ${esc(status)}`;badge.innerHTML=`<span class="dot"></span>${esc(labels[status]||status||'尚未启动')}`;if(active&&pipelineState&&pipelineState.id){$('#pipelineConcurrency').value=String(Math.max(1,Math.min(1,Number(pipelineState.concurrency)||1)));$('#pipelineRetryLimit').value=String(Math.max(0,Math.min(99,Number(pipelineState.retry_limit)||0)))}const total=Number(pipelineState&&pipelineState.total)||0,completed=Number(pipelineState&&pipelineState.completed)||0;$('#pipelineProgress').hidden=!(pipelineState&&pipelineState.id);$('#pipelineProgressTitle').textContent=paused?`已暂停 ${completed} / ${total}`:active?`正在处理 ${completed} / ${total}`:pipelineState&&pipelineState.id?`上一批次：${labels[status]||status}`:'等待启动';$('#pipelineProgressMeta').textContent=paused?'已停止派发新任务；已运行任务会正常收尾':active?`串行处理 1 个账号 · 失败最多重试 ${pipelineState.retry_limit||0} 次`:manualScope?`已手动选择 ${runnable.length} 个可运行账号`:`当前范围内 ${runnable.length} 个可运行账号`;const supplyTotal=Number(pipelineState&&pipelineState.supply_total)||0;if(supplyTotal){const supplyDone=Number(pipelineState&&pipelineState.supply_acquired)||0,supplyError=String(pipelineState&&pipelineState.supply_error||'');const supplyRetryAt=String(pipelineState&&pipelineState.supply_retry_at||''),supplyFailures=Number(pipelineState&&pipelineState.supply_failures)||0,supplyRetrySecs=Number(pipelineState&&pipelineState.supply_retry_seconds)||10;$('#pipelineProgressMeta').textContent=supplyError&&supplyRetryAt&&active?`取号失败，${supplyRetrySecs}s 后重试（已失败 ${supplyFailures} 次）：${supplyError}（已取到 ${supplyDone}/${supplyTotal} 个）`:supplyError?`取号已中断：${supplyError}（已取到 ${supplyDone}/${supplyTotal} 个）`:active?`取号+注册：已取 ${supplyDone}/${supplyTotal} 个 · 每个账号收尾后才取下一个`:`取号+注册：共取到 ${supplyDone}/${supplyTotal} 个`}$('#pipelineProgressBar').style.width=`${percent}%`;$('#pipelineCounts').innerHTML=`<span>待处理 ${countValue(counts,'queued','pending')}</span><span>运行中 ${countValue(counts,'running','active')}</span><span>重试等待 ${countValue(counts,'retry_wait','retrying')}</span><span>成功 ${countValue(counts,'success','completed')}</span><span>失败 ${countValue(counts,'failed')}</span>`;$('#pipelineReadyTitle').textContent=paused?`流水线已暂停，已完成 ${completed} / ${total}`:active?`正在处理 ${completed} / ${total} 个账号`:runnable.length?(manualScope?`已选择 ${runnable.length} 个可处理账号`:`当前范围内 ${runnable.length} 个可处理账号`):!overviewLoaded?'正在计算可处理账号':!accountRows.length?'请先导入已有账号':!accountsAvailable?'请先完成接码配置':manualScope?'请先在表格中勾选账号':'当前范围内没有可处理账号';$('#pipelineSelectionHint').textContent=paused?'暂停不会中断正在进行的网络步骤；点击继续后会恢复排队。':active?'流水线正在自动领取后续任务；你可以暂停派发或停止尚未领取的任务。':runnable.length?'已有凭证、正在运行或邮箱取码未就绪的账号会自动跳过。':manualScope?'切换到“全部待处理账号”可自动纳入当前可运行账号。':'可在账号清单中查看每个账号无法运行的原因。';$('#pipelineSettingsSummary').textContent=`${scopeText} · 串行执行 · 失败重试 ${retryLimit} 次`;$('#startPipeline').disabled=active||!accountsAvailable||!runnable.length;$('#startPipeline').textContent=paused?'流水线已暂停':active?'流水线运行中':runnable.length?`开始处理 ${runnable.length} 个账号`:!accountsAvailable?'请先完成接码配置':manualScope?'请先勾选账号':'暂无可处理账号';const exportSessionBtn=$('#exportSessionPipeline');if(exportSessionBtn){exportSessionBtn.disabled=active||!accountsAvailable||!runnable.length;exportSessionBtn.hidden=active;exportSessionBtn.title=runnable.length?`登录后导出 Session（${runnable.length} 个账号）`:'暂无可处理账号';}const loginOnlyBtn=$('#loginOnlyPipeline');if(loginOnlyBtn){loginOnlyBtn.disabled=active||!accountsAvailable||runnable.length!==1;loginOnlyBtn.hidden=active;loginOnlyBtn.title=runnable.length===1?`仅登录 ${runnable[0].email}（不导出 Session、不走 OAuth）`:runnable.length?'仅登录一次只能选择 1 个账号':'暂无可处理账号';}const gcashBtn=$('#gcashPipeline');if(gcashBtn){const bound=gcashTabsReady();gcashBtn.disabled=active||!accountsAvailable||!runnable.length||!bound;gcashBtn.hidden=active;gcashBtn.title=!bound?'请先在「调试」页绑定「ChatGPT登录」和「153提炼」两个标签页并保存':runnable.length?`对 ${runnable.length} 个账号串行执行 gcash 提炼（每个账号都需要人工扫码）`:'暂无可处理账号';}const registerBtn=$('#registerPipeline');if(registerBtn){const registerable=registerRunnableAccounts(scope);registerBtn.disabled=active||!registerable.length;registerBtn.hidden=active;registerBtn.title=registerable.length===1?`注册 ${registerable[0].email}（建号 + 设密码 + 邮箱验证码）`:registerable.length?`串行注册 ${registerable.length} 个待注册账号（建号 + 设密码 + 邮箱验证码）`:'没有待注册的 smsbower-gmail 账号';}$('#pausePipeline').hidden=!active||paused||stopping||!pipelineState.id;$('#resumePipeline').hidden=!paused||!pipelineState.id;$('#stopPipeline').hidden=!active||!pipelineState.id;$('#pipelineScope').disabled=active;$('#pipelineConcurrency').disabled=true;$('#pipelineRetryLimit').disabled=active;syncSmsbowerImportButton();renderOnboarding()}
 function stageLabel(value){const stage=String(value||'').toLowerCase(),map={queued:'等待 Worker',starting:'正在启动',mailbox:'读取邮箱验证码',email_otp:'读取邮箱验证码',login:'登录 ChatGPT',phone:'手机号验证',phone_verification:'手机号验证',sms:'等待短信验证码',oauth:'Codex OAuth 授权',credential:'保存凭证',retry_wait:'等待重试',done:'已完成'};return map[stage]||value||'准备中'}
 function renderJobs(rows){jobRows=Array.isArray(rows)?rows:[]}
 function renderAccounts(rows=accountRows,available=accountsAvailable){
@@ -95,8 +117,8 @@ $('#accountBulkBar').hidden=!selectedAccountIds.size;
 renderPipeline(pipelineState);
 if(currentView==='results')renderCredentials(artifactCredentials);
 if(!filtered.length){e.innerHTML=accountRows.length?'<div class="empty">没有匹配当前搜索或筛选条件的账号</div>':'<div class="account-empty-state"><span class="account-empty-icon">＋</span><strong>还没有导入账号</strong><p>先导入已有账号的登录素材，系统才能批量完成验证和 OAuth。</p><button type="button" class="primary" data-guide-action="import">立即导入账号</button></div>';return}
-const sourceNames={outlook:'Outlook / Graph',generic_api:'iCloud / 取码 API',code_url:'验证码 URL',password_totp:'密码 + TOTP 2FA'};
-e.innerHTML=`<div class="table-scroll"><table class="account-table"><thead><tr><th class="select-col"><input id="selectVisibleAccounts" type="checkbox" aria-label="选中当前筛选的所有账号"></th><th>账号</th><th>最近任务</th><th>最近更新</th><th>凭证 / 操作</th></tr></thead><tbody>${filtered.map(account=>{const id=String(account.id),selectedRow=selectedAccountIds.has(id),credential=accountHasCredential(account),rawStatus=String(account.codex_status||'').toLowerCase(),status=rawStatus||(credential?'success':'pending'),phone=String(account.phone_number||'').trim(),signupPassword=String(account.signup_password||'').trim();return `<tr class="${selectedRow?'account-row-selected':''}"><td class="select-cell" data-label="选择"><input type="checkbox" data-account-select="${esc(id)}" aria-label="选中 ${esc(account.email)}" ${selectedRow?'checked':''}></td><td class="account-main-cell" data-label="账号"><div class="account-email">${esc(account.email)}</div><div class="account-meta"><span class="badge">${esc(sourceNames[account.source]||account.source||'已导入')}</span><span class="badge ${account.otp_ready?'good':'bad'}">${account.otp_ready?'登录素材就绪':'登录素材未就绪'}</span>${credential?'<span class="badge purple">凭证可导出</span>':''}${account.phone_verified?'<span class="badge good">手机已验证</span>':''}</div>${phone?`<span class="account-phone">${esc(phone)}</span>`:''}${signupPassword?`<div class="account-secret"><span>注册密码</span><code>${esc(signupPassword)}</code></div>`:''}</td><td class="account-state-cell" data-label="最近任务"><span class="status ${esc(status)}"><span class="dot"></span>${esc(labels[status]||status||'待处理')}</span><div class="account-status-message">${esc(account.codex_message||(!account.otp_ready?'需要先补全登录素材':rawStatus?'暂无任务说明':credential?'最近无任务状态；凭证已归档':'等待加入批量处理'))}</div></td><td class="muted account-time-cell" data-label="最近更新">${esc(formatTime(account.updated_at))}</td><td class="account-action-cell" data-label="凭证 / 操作"><div class="account-actions">${credential?`<button data-account-credential="${esc(id)}">导出凭证</button>`:''}<button class="quiet-danger" data-delete="${esc(id)}">删除</button></div></td></tr>`}).join('')}</tbody></table></div>`;
+const sourceNames={outlook:'Outlook / Graph',generic_api:'iCloud / 取码 API',code_url:'验证码 URL',password_totp:'密码 + TOTP 2FA',smsbower_gmail:'smsbower-gmail'};
+e.innerHTML=`<div class="table-scroll"><table class="account-table"><thead><tr><th class="select-col"><input id="selectVisibleAccounts" type="checkbox" aria-label="选中当前筛选的所有账号"></th><th>账号</th><th>最近任务</th><th>最近更新</th><th>凭证 / 操作</th></tr></thead><tbody>${filtered.map(account=>{const id=String(account.id),selectedRow=selectedAccountIds.has(id),credential=accountHasCredential(account),rawStatus=String(account.codex_status||'').toLowerCase(),status=rawStatus||(credential?'success':'pending'),phone=String(account.phone_number||'').trim(),signupPassword=String(account.signup_password||'').trim();return `<tr class="${selectedRow?'account-row-selected':''}"><td class="select-cell" data-label="选择"><input type="checkbox" data-account-select="${esc(id)}" aria-label="选中 ${esc(account.email)}" ${selectedRow?'checked':''}></td><td class="account-main-cell" data-label="账号"><div class="account-email">${esc(account.email)}</div><div class="account-meta"><span class="badge">${esc(sourceNames[account.source]||account.source||'已导入')}</span>${account.source===SMSBOWER_GMAIL&&!account.otp_ready?`<span class="badge ${account.register_status==='failed'?'bad':''}">${esc(account.register_status==='failed'?'注册失败':'待注册')}</span>`:`<span class="badge ${account.otp_ready?'good':'bad'}">${account.otp_ready?'登录素材就绪':'登录素材未就绪'}</span>`}${credential?'<span class="badge purple">凭证可导出</span>':''}${account.plus_trial===true?'<span class="badge good">Plus 免费 1 个月</span>':''}${account.phone_verified?'<span class="badge good">手机已验证</span>':''}</div>${phone?`<span class="account-phone">${esc(phone)}</span>`:''}${signupPassword?`<div class="account-secret"><span>注册密码</span><code>${esc(signupPassword)}</code></div>`:''}</td><td class="account-state-cell" data-label="最近任务"><span class="status ${esc(status)}"><span class="dot"></span>${esc(labels[status]||status||'待处理')}</span><div class="account-status-message">${esc(account.codex_message||(!account.otp_ready?(account.source===SMSBOWER_GMAIL?(account.register_message||'已取号，等待注册流程'):'需要先补全登录素材'):rawStatus?'暂无任务说明':credential?'最近无任务状态；凭证已归档':'等待加入批量处理'))}</div></td><td class="muted account-time-cell" data-label="最近更新">${esc(formatTime(account.updated_at))}</td><td class="account-action-cell" data-label="凭证 / 操作"><div class="account-actions">${credential?`<button data-account-credential="${esc(id)}">导出凭证</button>`:''}${account.editable?`<button data-account-edit="${esc(id)}" title="手动设置登录密码 / 2FA 密钥">编辑</button>`:''}<button class="quiet-danger" data-delete="${esc(id)}">删除</button></div></td></tr>`}).join('')}</tbody></table></div>`;
 const selectAll=$('#selectVisibleAccounts');
 selectAll.checked=!!filtered.length&&selectedVisible.length===filtered.length;
 selectAll.indeterminate=selectedVisible.length>0&&selectedVisible.length<filtered.length;
@@ -325,6 +347,269 @@ async function loadSmsStats({silent=false}={}){if(smsStatsLoading)return smsStat
     }catch(e){setDebugSnapshotResult(`❌ 快照失败：${esc(e.message)}`);toast('快照失败：'+e.message)}
     finally{debugSnapshotBusy=false;updateDebugSnapshotButton()}
   }
+  // ----------------------------------------------------------------- 代理管理
+  // The pool lives in the backend (data/proxies.json); the extension is what
+  // actually routes traffic, so every pool change that affects "right now" also
+  // pushes a chrome.proxy update through the service worker.
+  let proxyState={enabled:false,proxies:[],summary:{total:0,active:0,untested:0,failed:0}},proxyBusy=false,proxyTesting=new Set();
+  function proxyStatusLabel(row){if(row.status==='ok')return ['可用','on'];if(row.status==='failed')return ['不可用',''];return ['未测试','']}
+  function proxyLatencyMarkup(row){const value=Number(row.latency_ms);if(!Number.isFinite(value))return '<span class="proxy-latency none">—</span>';const tone=value<600?'fast':value<1200?'mid':'slow';return `<span class="proxy-latency ${tone}">${esc(value)}ms</span>`}
+  function renderProxyStats(){const s=proxyState.summary||{},cells=[['总代理数',s.total||0,''],['已启用',s.active||0,'good'],['未测试',s.untested||0,'warn'],['测试失败',s.failed||0,'bad']];$('#proxyStats').innerHTML=cells.map(([label,value,tone])=>`<div class="proxy-stat ${tone}"><strong>${esc(value)}</strong><span>${esc(label)}</span></div>`).join('')}
+  function renderProxyToggle(){const button=$('#proxyPoolToggle'),state=$('#proxyPoolState'),on=!!proxyState.enabled;button.setAttribute('aria-checked',on?'true':'false');state.className='proxy-pool-state'+(on?' on':'');state.textContent=on?'代理池已启用':'代理池已禁用';button.disabled=proxyBusy}
+  function renderProxyTable(){
+    const rows=Array.isArray(proxyState.proxies)?proxyState.proxies:[],target=$('#proxyTable');
+    if(!rows.length){target.innerHTML='<div class="empty">尚未添加代理；在上方粘贴代理 URL 后点「确认添加」。</div>';return}
+    target.innerHTML=`<div class="table-scroll"><table class="proxy-table"><thead><tr><th>代理 URL</th><th>状态</th><th>地址</th><th>IP</th><th>延迟</th><th style="text-align:right">操作</th></tr></thead><tbody>${rows.map(row=>{
+      const [statusText,statusTone]=proxyStatusLabel(row),testing=proxyTesting.has(row.id);
+      const failure=row.status==='failed'&&row.message?`<div class="proxy-message">${esc(row.message)}</div>`:'';
+      return `<tr class="${testing?'proxy-row-testing':''}"><td><div class="proxy-url">${esc(row.url_masked)}</div>${row.label?`<span class="proxy-label-tag">${esc(row.label)}</span>`:''}${failure}</td>`
+        +`<td><span class="proxy-state ${row.enabled?'on':''}">${row.enabled?'● 启用':'○ 禁用'}</span><div class="section-note" style="margin-top:5px">${esc(testing?'测试中…':statusText)}</div></td>`
+        +`<td>${esc(row.location||'—')}</td><td class="mono">${esc(row.ip||'—')}</td><td>${proxyLatencyMarkup(row)}</td>`
+        +`<td><div class="proxy-actions"><button type="button" data-proxy-test="${esc(row.id)}" ${testing?'disabled':''}>▷ 测试</button>`
+        +`<button type="button" data-proxy-toggle="${esc(row.id)}" data-enabled="${row.enabled?'1':'0'}">${row.enabled?'禁用':'启用'}</button>`
+        +`<button type="button" class="quiet-danger" data-proxy-delete="${esc(row.id)}">删除</button></div></td></tr>`}).join('')}</tbody></table></div>`;
+  }
+  function renderProxies(state){if(state&&typeof state==='object')proxyState={enabled:!!state.enabled,proxies:Array.isArray(state.proxies)?state.proxies:[],summary:state.summary||{}};renderProxyToggle();renderProxyStats();renderProxyTable()}
+  // Chrome applies a proxy browser-wide and it stays until something replaces or
+  // clears it, so always show what the browser is actually using right now —
+  // otherwise a proxy left over from the last batch silently carries normal
+  // browsing too.
+  async function renderActiveProxy(){
+    const target=$('#proxyActive');if(!target)return;
+    try{
+      const result=await runtimeMessage('get-active-proxy',{},8000);
+      const proxy=result&&result.proxy;
+      target.innerHTML=proxy
+        ?`浏览器当前正在使用代理：<b>${esc(proxy.label||proxy.scheme||'')}</b>。它会一直生效，直到下一个账号换用别的代理，或你在上方关闭代理池。`
+        :'浏览器当前为直连（未设置代理）。启用代理池后，下一批任务的每个账号都会按顺序取用池中的代理。';
+    }catch(e){target.textContent='无法读取浏览器当前代理：'+e.message}
+  }
+  async function loadProxies(){try{renderProxies(await api('/api/proxies'))}catch(e){toast('代理池读取失败：'+e.message)}finally{renderActiveProxy()}}
+  // 时区/语言由「调试 → 指纹」指定（不再跟代理走），这里只负责核对页面真实值。
+  async function inspectFingerprint(){
+    const button=$('#proxyInspect');button.disabled=true;
+    const target=$('#proxyActive');
+    try{
+      const result=await runtimeMessage('inspect-fingerprint',{},15000);
+      if(!result||result.ok===false)throw new Error((result&&result.error)||'读取失败');
+      if(result.page&&result.page.error)throw new Error(result.page.error);
+      const {ok,rows}=fingerprintCheckRows(result);
+      target.innerHTML=rows.map(([k,v])=>`${esc(k)}：<b>${esc(v)}</b>`).join('<br>');
+      toast(ok?'指纹检查完成':'指纹与设定不一致，见下方结果');
+    }catch(e){target.textContent='指纹检查失败：'+e.message;toast('指纹检查失败：'+e.message)}
+    finally{button.disabled=false}
+  }
+  // Turning the pool off must take effect immediately, not at the next account:
+  // clear the browser proxy right away. Turning it on only records the intent —
+  // the concrete proxy is picked per account when a batch starts.
+  async function pushProxyToBrowser(proxy){try{const r=await runtimeMessage('apply-proxy',{proxy:proxy||null},15000);if(!r||r.ok===false)throw new Error((r&&r.error)||'浏览器代理设置失败');if(r.warning)toast(r.warning);return r}catch(e){toast('浏览器代理设置失败：'+e.message);return null}}
+  async function toggleProxyPool(){
+    if(proxyBusy)return;proxyBusy=true;renderProxyToggle();
+    const next=!proxyState.enabled;
+    try{
+      renderProxies(await api('/api/proxies/enabled',{method:'POST',body:JSON.stringify({enabled:next})}));
+      if(!next)await pushProxyToBrowser(null);
+      toast(next?'代理池已启用：下一批任务的每个账号会按顺序取用代理':'代理池已禁用，浏览器已恢复直连');
+      renderActiveProxy();
+    }catch(e){toast('切换失败：'+e.message)}
+    finally{proxyBusy=false;renderProxyToggle()}
+  }
+  function proxyInputLines(){return $('#proxyInput').value.split(/\r?\n/).map(line=>line.trim()).filter(Boolean)}
+  function updateProxyAddButton(){const lines=proxyInputLines();$('#proxyAdd').disabled=!lines.length;$('#proxyAdd').textContent=lines.length?`确认添加 ${lines.length} 条`:'确认添加'}
+  function setProxyFeedback(text,warn=false){const target=$('#proxyAddFeedback');if(!text){target.hidden=true;return}target.hidden=false;target.className='proxy-feedback'+(warn?' warn':'');target.textContent=text}
+  async function addProxies(){
+    const lines=proxyInputLines();if(!lines.length){toast('请先粘贴代理地址');return}
+    const button=$('#proxyAdd');button.disabled=true;
+    try{
+      const result=await api('/api/proxies',{method:'POST',body:JSON.stringify({text:$('#proxyInput').value,label:$('#proxyLabel').value.trim()})});
+      renderProxies(result);
+      const invalid=Array.isArray(result.invalid)?result.invalid:[];
+      const summary=`已添加 ${result.inserted||0} 条，更新 ${result.updated||0} 条${invalid.length?`，${invalid.length} 行无法识别`:''}`;
+      setProxyFeedback(invalid.length?`${summary}：\n${invalid.slice(0,5).join('\n')}`:summary,!!invalid.length);
+      toast(summary);
+      if(!invalid.length){$('#proxyInput').value='';updateProxyAddButton()}
+    }catch(e){setProxyFeedback('添加失败：'+e.message,true);toast('添加失败：'+e.message)}
+    finally{updateProxyAddButton()}
+  }
+  async function testProxies(ids){
+    const targets=Array.isArray(ids)?ids:null;
+    if(targets&&!targets.length)return;
+    (targets||proxyState.proxies.map(row=>row.id)).forEach(id=>proxyTesting.add(id));
+    renderProxyTable();
+    const allButton=$('#proxyTestAll');allButton.disabled=true;
+    try{
+      const payload=targets?{proxy_ids:targets}:{};
+      const result=await api('/api/proxies/test',{method:'POST',body:JSON.stringify(payload)});
+      proxyTesting.clear();renderProxies(result);
+      const ok=(result.proxies||[]).filter(row=>row.status==='ok').length;
+      toast(`测试完成：${result.tested||0} 条已测，可用 ${ok} 条`);
+    }catch(e){proxyTesting.clear();renderProxyTable();toast('测试失败：'+e.message)}
+    finally{allButton.disabled=false}
+  }
+  async function setProxyEnabled(id,enabled){
+    try{renderProxies(await api(`/api/proxies/${encodeURIComponent(id)}/enabled`,{method:'POST',body:JSON.stringify({enabled})}));toast(enabled?'代理已启用':'代理已禁用')}
+    catch(e){toast('操作失败：'+e.message)}
+  }
+  async function deleteProxy(id){
+    if(!confirm('将从代理池删除这条代理，正在运行的任务不受影响。确定继续？'))return;
+    try{renderProxies(await api(`/api/proxies/${encodeURIComponent(id)}`,{method:'DELETE'}));toast('代理已删除')}
+    catch(e){toast('删除失败：'+e.message)}
+  }
+  // --------------------------------------------------------------- 通用配置
+  // Browser-side waiting budgets. Stored in the backend (data/browser-config.json)
+  // and pushed to the extension inside every bridge payload, so a change applies
+  // to the next account without reloading the extension.
+  let browserConfig=null,browserConfigBusy=false;
+  const BROWSER_CONFIG_DEFAULTS={page_load_timeout_ms:45000,element_wait_timeout_ms:30000};
+  function setBrowserConfigResult(html,state){const target=$('#browserConfigResult');if(!target)return;target.className='debug-result'+(state?' '+state:'');target.innerHTML=html}
+  function renderBrowserConfig(config){
+    browserConfig=config&&typeof config==='object'?config:null;
+    const values=browserConfig||BROWSER_CONFIG_DEFAULTS;
+    $('#pageLoadTimeout').value=String(Math.round(Number(values.page_load_timeout_ms||0)/1000));
+    $('#elementWaitTimeout').value=String(Math.round(Number(values.element_wait_timeout_ms||0)/1000));
+    const derived=browserConfig&&browserConfig.derived||{};
+    const seconds=value=>Math.round(Number(value||0)/1000);
+    const isDefault=values.page_load_timeout_ms===BROWSER_CONFIG_DEFAULTS.page_load_timeout_ms&&values.element_wait_timeout_ms===BROWSER_CONFIG_DEFAULTS.element_wait_timeout_ms;
+    const note=$('#browserConfigSaved');
+    if(note){note.className='debug-section-note'+(isDefault?'':' ok');note.textContent=isDefault?'当前为默认值':'已自定义'}
+    setBrowserConfigResult(`当前生效：页面加载 <b>${esc(seconds(values.page_load_timeout_ms))}s</b> · 元素等待 <b>${esc(seconds(values.element_wait_timeout_ms))}s</b>。`
+      +`<div class="debug-note">后端等待上限（自动推导，始终更长）：导航 ${esc(seconds(derived.navigate_bridge_timeout_ms))}s · 页面动作 ${esc(seconds(derived.page_action_bridge_timeout_ms))}s。`
+      +`<br>元素等待是「基准值」：改大它，一步之内所有等待（点登录链接、等邮箱框、等跳转落地）都会按同一比例放大。</div>`);
+  }
+  async function loadBrowserConfig(){try{const result=await api('/api/browser-config');renderBrowserConfig(result.config)}catch(e){setBrowserConfigResult(`❌ 读取失败：${esc(e.message)}`)}}
+  async function saveBrowserConfig(values){
+    if(browserConfigBusy)return;
+    browserConfigBusy=true;$('#saveBrowserConfig').disabled=true;$('#resetBrowserConfig').disabled=true;
+    try{
+      const payload=values||{page_load_timeout_ms:Math.round(Number($('#pageLoadTimeout').value)*1000),element_wait_timeout_ms:Math.round(Number($('#elementWaitTimeout').value)*1000)};
+      const result=await api('/api/browser-config',{method:'POST',body:JSON.stringify(payload)});
+      renderBrowserConfig(result.config);
+      toast('通用配置已保存，下一个账号开始时生效');
+    }catch(e){setBrowserConfigResult(`❌ 保存失败：${esc(e.message)}`);toast('保存失败：'+e.message)}
+    finally{browserConfigBusy=false;$('#saveBrowserConfig').disabled=false;$('#resetBrowserConfig').disabled=false}
+  }
+  // ----------------------------------------------------------------- 指纹
+  // 时区 / 语言由用户在这里显式指定，通过 CDP 作用于整个浏览器（地址栏导航、
+  // 页面里的 fetch/XHR 都算），不再跟着代理所在地自动变。
+  // 两处存储各有分工：后端 data/browser-config.json 是「配置」（可查看、可备份），
+  // chrome.storage.local 里那份是「还在生效的那份」——侧边栏关掉后 service worker
+  // 仍要靠它把覆盖挂在每个新标签页上。打开本页和保存时把后端那份推下去对齐。
+  const FINGERPRINT_DEFAULT={enabled:false,timezone:'',language:''};
+  // Intl.supportedValuesOf 在 Chrome 99+ 直接给出完整 IANA 时区表；这份兜底只在
+  // 老内核上用，保证输入框仍有可选项（手输任何值也依然接受）。
+  const FINGERPRINT_TIMEZONE_FALLBACK=['UTC','Africa/Cairo','Africa/Johannesburg','Africa/Lagos','Africa/Nairobi','America/Anchorage','America/Argentina/Buenos_Aires','America/Bogota','America/Chicago','America/Denver','America/Halifax','America/Los_Angeles','America/Mexico_City','America/New_York','America/Phoenix','America/Sao_Paulo','America/Toronto','America/Vancouver','Asia/Bangkok','Asia/Dubai','Asia/Hong_Kong','Asia/Jakarta','Asia/Jerusalem','Asia/Kolkata','Asia/Karachi','Asia/Kuala_Lumpur','Asia/Manila','Asia/Riyadh','Asia/Seoul','Asia/Shanghai','Asia/Singapore','Asia/Taipei','Asia/Tokyo','Atlantic/Reykjavik','Australia/Brisbane','Australia/Melbourne','Australia/Perth','Australia/Sydney','Europe/Amsterdam','Europe/Athens','Europe/Berlin','Europe/Brussels','Europe/Bucharest','Europe/Budapest','Europe/Copenhagen','Europe/Dublin','Europe/Helsinki','Europe/Istanbul','Europe/Kyiv','Europe/Lisbon','Europe/London','Europe/Madrid','Europe/Moscow','Europe/Oslo','Europe/Paris','Europe/Prague','Europe/Rome','Europe/Stockholm','Europe/Vienna','Europe/Warsaw','Europe/Zurich','Pacific/Auckland','Pacific/Honolulu'];
+  const FINGERPRINT_LOCALES=['en-US','en-GB','en-AU','en-CA','en-IE','en-IN','en-NZ','en-PH','en-SG','en-ZA','af-ZA','am-ET','ar-AE','ar-DZ','ar-EG','ar-IQ','ar-JO','ar-KW','ar-MA','ar-SA','az-AZ','be-BY','bg-BG','bn-BD','bn-IN','bs-BA','ca-ES','cs-CZ','cy-GB','da-DK','de-AT','de-CH','de-DE','el-GR','es-AR','es-CL','es-CO','es-CR','es-DO','es-EC','es-ES','es-GT','es-MX','es-PA','es-PE','es-PY','es-US','es-UY','es-VE','et-EE','eu-ES','fa-IR','fi-FI','fil-PH','fr-BE','fr-CA','fr-CH','fr-FR','ga-IE','gl-ES','gu-IN','he-IL','hi-IN','hr-HR','hu-HU','hy-AM','id-ID','is-IS','it-CH','it-IT','ja-JP','ka-GE','kk-KZ','km-KH','kn-IN','ko-KR','ky-KG','lo-LA','lt-LT','lv-LV','mk-MK','ml-IN','mn-MN','mr-IN','ms-MY','my-MM','nb-NO','ne-NP','nl-BE','nl-NL','nn-NO','pa-IN','pl-PL','ps-AF','pt-AO','pt-BR','pt-PT','ro-MD','ro-RO','ru-BY','ru-KZ','ru-RU','si-LK','sk-SK','sl-SI','sq-AL','sr-RS','sv-FI','sv-SE','sw-KE','sw-TZ','ta-IN','ta-LK','te-IN','th-TH','tk-TM','tr-TR','uk-UA','ur-PK','uz-UZ','vi-VN','zh-CN','zh-HK','zh-MO','zh-SG','zh-TW','zu-ZA'];
+  let fingerprintConfig={...FINGERPRINT_DEFAULT},fingerprintBusy=false,fingerprintOptionsReady=false;
+  function fingerprintTimezoneList(){try{const list=Intl.supportedValuesOf('timeZone');if(Array.isArray(list)&&list.length)return list}catch(e){}return FINGERPRINT_TIMEZONE_FALLBACK}
+  function timezoneOffsetLabel(tz){try{const part=new Intl.DateTimeFormat('en-US',{timeZone:tz,timeZoneName:'shortOffset'}).formatToParts(new Date()).find(item=>item.type==='timeZoneName');return part?part.value:''}catch(e){return ''}}
+  function localeLabel(tag){try{const name=new Intl.DisplayNames(['zh-CN'],{type:'language'}).of(tag);return name&&name!==tag?name:tag}catch(e){return tag}}
+  function timezoneIsValid(tz){try{new Intl.DateTimeFormat('en-US',{timeZone:tz});return true}catch(e){return false}}
+  function localeIsValid(tag){try{return /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(tag)&&Intl.getCanonicalLocales(tag).length>0}catch(e){return false}}
+  function populateFingerprintOptions(){
+    if(fingerprintOptionsReady)return;fingerprintOptionsReady=true;
+    const tzHost=$('#fingerprintTimezoneList');
+    if(tzHost)tzHost.innerHTML=fingerprintTimezoneList().map(tz=>`<option value="${esc(tz)}" label="${esc(tz.replace(/_/g,' '))} ${esc(timezoneOffsetLabel(tz))}"></option>`).join('');
+    const langHost=$('#fingerprintLanguageList');
+    if(langHost)langHost.innerHTML=FINGERPRINT_LOCALES.map(tag=>`<option value="${esc(tag)}" label="${esc(localeLabel(tag))}"></option>`).join('');
+  }
+  function setFingerprintResult(html,state){const target=$('#fingerprintResult');if(!target)return;target.className='debug-result'+(state?' '+state:'');target.innerHTML=html}
+  function renderFingerprintHints(){
+    const tz=String($('#fingerprintTimezone').value||'').trim(),lang=String($('#fingerprintLanguage').value||'').trim();
+    const tzHint=$('#fingerprintTimezoneHint'),langHint=$('#fingerprintLanguageHint');
+    const tzOk=!tz||timezoneIsValid(tz),langOk=!lang||localeIsValid(lang);
+    $('#fingerprintTimezone').classList.toggle('invalid',!tzOk);
+    $('#fingerprintLanguage').classList.toggle('invalid',!langOk);
+    if(tzHint)tzHint.innerHTML=!tz?'IANA 时区名，可直接输入关键词筛选（如 Tokyo）'
+      :!tzOk?'⚠️ 浏览器不认识这个时区名'
+      :`该时区当前时间 <b>${esc(new Date().toLocaleString('zh-CN',{timeZone:tz,hour12:false}))}</b>（${esc(timezoneOffsetLabel(tz))}）`;
+    if(langHint)langHint.innerHTML=!lang?'BCP-47 语言标签，同时决定 <code>navigator.language</code> 与 <code>Accept-Language</code>'
+      :!langOk?'⚠️ 不是合法的 BCP-47 语言标签'
+      :`${esc(localeLabel(lang))} · 请求头将发送 <code>${esc(lang.includes('-')?`${lang},${lang.split('-')[0]};q=0.9`:lang)}</code>`;
+  }
+  function renderFingerprint(config,applied){
+    fingerprintConfig={...FINGERPRINT_DEFAULT,...(config&&typeof config==='object'?config:{})};
+    $('#fingerprintEnabled').checked=!!fingerprintConfig.enabled;
+    $('#fingerprintTimezone').value=fingerprintConfig.timezone||'';
+    $('#fingerprintLanguage').value=fingerprintConfig.language||'';
+    renderFingerprintHints();
+    const note=$('#fingerprintState');
+    if(note){note.className='debug-section-note'+(fingerprintConfig.enabled?' ok':'');note.textContent=fingerprintConfig.enabled?'已启用':'未启用'}
+    if(!fingerprintConfig.enabled){
+      setFingerprintResult('当前<b>未启用</b>：浏览器仍然报本机时区与语言。填好时区和语言、勾选开关再点「保存并应用」即可全局生效。');
+      return;
+    }
+    const tabs=applied&&Number(applied.applied);
+    const skipped=applied&&Number(applied.skipped);
+    setFingerprintResult(`已启用：时区 <b>${esc(fingerprintConfig.timezone)}</b> · 语言 <b>${esc(fingerprintConfig.language)}</b>。`
+      +`<div class="debug-note">${Number.isFinite(tabs)?`已挂到 <b>${esc(tabs)}</b> 个标签页${skipped?`（${esc(skipped)} 个跳过：多为 chrome:// 等无法调试的页面，或该页开着 DevTools）`:''}；`:''}`
+      +`新开的标签页会自动带上。点「检查当前页」可核对页面真实看到的值。</div>`);
+  }
+  async function pushFingerprintToBrowser(config){
+    try{
+      const result=await runtimeMessage('set-fingerprint',{fingerprint:config},30000);
+      if(!result||result.ok===false)throw new Error((result&&result.error)||'扩展未能应用指纹');
+      return result.fingerprint||null;
+    }catch(e){toast('浏览器指纹应用失败：'+e.message);return null}
+  }
+  async function loadFingerprint(){
+    populateFingerprintOptions();
+    try{
+      const result=await api('/api/browser-config');
+      const config=(result.config&&result.config.fingerprint)||{...FINGERPRINT_DEFAULT};
+      // 顺便把覆盖重新挂一遍：service worker 会休眠重启，重启会带走 CDP 会话。
+      renderFingerprint(config,await pushFingerprintToBrowser(config));
+    }catch(e){setFingerprintResult(`❌ 读取失败：${esc(e.message)}`)}
+  }
+  async function saveFingerprint(){
+    if(fingerprintBusy)return;
+    const enabled=$('#fingerprintEnabled').checked;
+    const timezone=String($('#fingerprintTimezone').value||'').trim();
+    const language=String($('#fingerprintLanguage').value||'').trim();
+    if(enabled&&(!timezone||!language)){toast('启用指纹前必须同时填写时区和语言');return}
+    if(timezone&&!timezoneIsValid(timezone)){toast(`浏览器不认识时区：${timezone}`);return}
+    if(language&&!localeIsValid(language)){toast(`不是合法的语言标签：${language}`);return}
+    fingerprintBusy=true;$('#saveFingerprint').disabled=true;
+    try{
+      const result=await api('/api/browser-config',{method:'POST',body:JSON.stringify({fingerprint:{enabled,timezone,language}})});
+      const saved=(result.config&&result.config.fingerprint)||{enabled,timezone,language};
+      renderFingerprint(saved,await pushFingerprintToBrowser(saved));
+      toast(saved.enabled?`指纹已全局生效：${saved.timezone} · ${saved.language}`:'指纹覆盖已关闭，浏览器恢复本机时区与语言');
+    }catch(e){setFingerprintResult(`❌ 保存失败：${esc(e.message)}`);toast('保存失败：'+e.message)}
+    finally{fingerprintBusy=false;$('#saveFingerprint').disabled=false}
+  }
+  // 「已对齐」应该是能验证的事实而不是口头保证：读回页面自己报出来的值。
+  function fingerprintCheckRows(result){
+    const page=result.page||{},want=result.fingerprint||{},proxy=result.proxy||null;
+    const offset=Number(page.timezone_offset_minutes)||0;
+    const gotTz=String(page.timezone||''),gotLang=String(page.language||'');
+    const tzOk=!want.enabled||!want.timezone||want.timezone===gotTz;
+    const langOk=!want.enabled||!want.language||gotLang.toLowerCase()===String(want.language).toLowerCase();
+    return {
+      ok:tzOk&&langOk,
+      rows:[
+        ['当前页',page.url||'—'],
+        ['设定指纹',want.enabled?`${want.timezone||'?'} · ${want.language||'?'}`:'未启用（页面报的是本机值）'],
+        ['页面看到的时区',`${gotTz||'?'}（UTC${offset>0?'-':'+'}${Math.abs(Math.round(offset/60))}）${want.enabled?(tzOk?'✅ 一致':'⚠️ 与设定不一致'):''}`],
+        ['页面看到的语言',`${gotLang||'?'} / ${page.languages||'?'}${want.enabled?(langOk?' ✅ 一致':' ⚠️ 与设定不一致'):''}`],
+        ['浏览器当前代理',proxy?`${proxy.label||proxy.country_code||'已设置'}${proxy.timezone?` · 所在地时区 ${proxy.timezone}`:''}`:'未使用代理'],
+        ['navigator.webdriver',page.webdriver?'⚠️ true（会被识别为自动化）':'false'],
+      ],
+    };
+  }
+  async function inspectFingerprintFromDebug(){
+    const button=$('#inspectFingerprintDebug');button.disabled=true;
+    setFingerprintResult('正在读取当前活动页真实看到的值…','loading');
+    try{
+      const result=await runtimeMessage('inspect-fingerprint',{},15000);
+      if(!result||result.ok===false)throw new Error((result&&result.error)||'读取失败');
+      if(result.page&&result.page.error)throw new Error(result.page.error);
+      const {ok,rows}=fingerprintCheckRows(result);
+      setFingerprintResult(rows.map(([k,v])=>`${esc(k)}：<b>${esc(v)}</b>`).join('<br>')
+        +`<div class="debug-note">${ok?'页面报出的值与设定一致。':'页面报出的值与设定不一致：该页可能在启用前就打开了（刷新即可），或它开着 DevTools 导致无法挂调试会话。'}</div>`);
+      toast(ok?'指纹检查完成：一致':'指纹检查完成：存在不一致');
+    }catch(e){setFingerprintResult(`❌ 指纹检查失败：${esc(e.message)}`);toast('指纹检查失败：'+e.message)}
+    finally{button.disabled=false}
+  }
   let gcashTabs={login_tab_id:null,extract_tab_id:null},gcashTabsLoaded=false,gcashSaveBusy=false;
   function gcashTabLabel(tab){return `[${tab.id}] ${tab.title||'(无标题)'} — ${tab.url||'(无地址)'}`}
   function setGcashTabsResult(html,state){const target=$('#gcashTabsResult');if(!target)return;target.className='debug-result'+(state?' '+state:'');target.innerHTML=html}
@@ -425,10 +710,12 @@ async function loadSmsStats({silent=false}={}){if(smsStatsLoading)return smsStat
 async function triggerDownload(url,filename='download.bin'){return saveRemoteFile(url,{filename})}
 async function triggerJsonDownload(url,payload,filename,method='POST'){return saveRemoteFile(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),filename})}
 async function copyText(value){if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(value);return}const area=document.createElement('textarea');area.value=value;area.setAttribute('readonly','');area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();const copied=document.execCommand('copy');area.remove();if(!copied)throw new Error('浏览器不允许自动复制，请在日志内容中手动选择复制')}
-$('#importAccounts').onclick=async()=>{const button=$('#importAccounts'),feedback=$('#importFeedback');button.disabled=true;feedback.hidden=true;try{const text=$('#materials').value.trim();if(!text)throw new Error('请先粘贴账号素材');const j=await api('/api/accounts/import',{method:'POST',body:JSON.stringify({source:$('#source').value,text})}),message=`导入完成：新增 ${j.inserted}，更新 ${j.updated}，无效 ${j.invalid}`;toast(message);feedback.hidden=false;feedback.className=`import-feedback${j.invalid?' warn':''}`;feedback.textContent=j.invalid?`${message}。请检查上方每行格式后重新导入。`:message;if(!j.invalid){$('#materials').value='';updateImportHelper();$('#importPanel').open=false}await refresh()}catch(e){feedback.hidden=false;feedback.className='import-feedback warn';feedback.textContent='导入失败：'+e.message;toast(e.message)}finally{button.disabled=!importMaterialLines().length}};
+$('#importAccounts').onclick=async()=>{const button=$('#importAccounts'),feedback=$('#importFeedback'),smsbower=importIsSmsbowerGmail();button.disabled=true;feedback.hidden=true;try{let message='',warn='';if(smsbower){const count=smsbowerMailCount();if(pipelineIsActive())throw new Error('已有流水线正在运行，请先等待或停止当前任务');if(!confirm(`将逐个执行「取号 → 注册」，共 ${count} 个账号：每取到 1 个邮箱就立刻建号、设置密码、轮询邮箱验证码并开启 2FA，这个账号收尾后才取下一个号。此操作会真实消耗取号费用，期间请保持浏览器可用。确定继续？`))return;try{await runBrowserCleanup('开始新任务前清理浏览器环境',{quiet:true})}catch(error){console.warn('pre-start cleanup failed',error);toast('启动前浏览器清理失败，已继续尝试启动任务')}const j=await api('/api/accounts/acquire-register-smsbower-gmail',{method:'POST',body:JSON.stringify({count,retry_limit:Math.max(0,Math.min(99,Number($('#pipelineRetryLimit').value)||0)),retry_backoff_seconds:30,confirmed:true})});pipelineState=j.pipeline||pipelineState;message=`已启动取号+注册：${count} 个账号将逐个取号并注册，进度见「批量处理账号」`}else{const text=$('#materials').value.trim();if(!text)throw new Error('请先粘贴账号素材');const j=await api('/api/accounts/import',{method:'POST',body:JSON.stringify({source:$('#source').value,text})});message=`导入完成：新增 ${j.inserted}，更新 ${j.updated}，无效 ${j.invalid}`;if(j.invalid)warn='请检查上方每行格式后重新导入。';else{$('#materials').value='';updateImportHelper();$('#importPanel').open=false}}toast(message);feedback.hidden=false;feedback.className=`import-feedback${warn?' warn':''}`;feedback.textContent=warn?`${message}。${warn}`:message;await refresh()}catch(e){feedback.hidden=false;feedback.className='import-feedback warn';feedback.textContent=(smsbower?'启动失败：':'导入失败：')+e.message;toast(e.message)}finally{if(smsbower)syncSmsbowerImportButton();else button.disabled=!importMaterialLines().length}};
 document.addEventListener('click',event=>{const action=event.target.closest('[data-guide-action]');if(!action)return;event.preventDefault();focusWorkflowAction(action.dataset.guideAction)});
 $('#openImportFromAccounts').onclick=()=>focusWorkflowAction('import');
-$('#source').onchange=updateImportHelper;
+$('#source').onchange=()=>{updateImportHelper();if(importIsSmsbowerGmail())loadSmsbowerMailConfig()};
+$('#smsbowerMailCount').oninput=updateImportHelper;
+$('#saveSmsbowerMailConfig').onclick=saveSmsbowerMailConfig;
 $('#materials').oninput=updateImportHelper;
   $('#queryHeroBalance').onclick=queryHeroBalance;
   $('#queryHeroOffers').onclick=queryHeroOffers;
@@ -438,6 +725,18 @@ $('#materials').oninput=updateImportHelper;
   $('#debugRefreshTabs').onclick=()=>loadDebugTabs();
   $('#debugTabInjectableOnly').onchange=()=>renderDebugTabs();
   $('#gcashSaveTabs').onclick=saveGcashTabs;
+  $('#saveBrowserConfig').onclick=()=>saveBrowserConfig();
+  $('#resetBrowserConfig').onclick=()=>saveBrowserConfig({...BROWSER_CONFIG_DEFAULTS});
+  $('#saveFingerprint').onclick=saveFingerprint;
+  $('#inspectFingerprintDebug').onclick=inspectFingerprintFromDebug;
+  $('#fingerprintTimezone').oninput=renderFingerprintHints;
+  $('#fingerprintLanguage').oninput=renderFingerprintHints;
+  $('#proxyPoolToggle').onclick=toggleProxyPool;
+  $('#proxyTestAll').onclick=()=>{if(!proxyState.proxies.length){toast('代理池为空');return}testProxies(null)};
+  $('#proxyAdd').onclick=addProxies;
+  $('#proxyInspect').onclick=inspectFingerprint;
+  $('#proxyInput').oninput=updateProxyAddButton;
+  $('#proxyTable').onclick=event=>{const test=event.target.closest('[data-proxy-test]'),toggle=event.target.closest('[data-proxy-toggle]'),remove=event.target.closest('[data-proxy-delete]');if(test)testProxies([test.dataset.proxyTest]);else if(toggle)setProxyEnabled(toggle.dataset.proxyToggle,toggle.dataset.enabled!=='1');else if(remove)deleteProxy(remove.dataset.proxyDelete)};
 document.querySelectorAll('[data-view]').forEach(button=>button.onclick=()=>switchWorkspace(button.dataset.view));
 $('#accountSearch').oninput=()=>renderAccounts();
 $('#accountFilter').onchange=()=>renderAccounts();
@@ -453,12 +752,14 @@ $('#selectAllCredentials').onclick=()=>{const choices=credentialExportChoices();
 $('#clearCredentialSelection').onclick=()=>{selectedCredentialExports.clear();renderCredentials(artifactCredentials)};
 $('#downloadSelectedCredentials').onclick=async()=>{const payload=selectedCredentialPayload(),count=payload.account_ids.length+payload.credential_ids.length,format=$('#credentialExportFormat').value;if(!count){toast('请先选择至少一个凭证');return}const label=format==='sub2api'?'Sub2API 导入 JSON':'Codex 原始 JSON 压缩包',filename=format==='sub2api'?'sub2api-accounts.json':'codex-selected-credentials.zip';if(!confirm(`将以“${label}”导出所选 ${count} 个账号的完整 OAuth Token。确定继续？`))return;const button=$('#downloadSelectedCredentials');button.disabled=true;try{await triggerJsonDownload('/api/artifacts/credentials/selected/export',{...payload,format,confirmed:true},filename);toast(`已保存 ${count} 个凭证：${label}`)}catch(error){toast('导出失败：'+error.message)}finally{renderCredentials(artifactCredentials)}};
 $('#deleteSelectedCredentials').onclick=async()=>{const payload=selectedCredentialPayload(),count=payload.account_ids.length+payload.credential_ids.length;if(!count){toast('请先选择至少一个凭证');return}if(!confirm(`将永久删除本机所选 ${count} 个 OAuth 凭证文件，但保留账号登录素材。确定继续？`))return;const button=$('#deleteSelectedCredentials');button.disabled=true;try{const result=await api('/api/artifacts/credentials/selected',{method:'DELETE',body:JSON.stringify({...payload,confirmed:true})});selectedCredentialExports.clear();toast(`已删除 ${result.deleted||count} 个凭证`);await refresh();await loadArtifacts()}catch(error){toast('凭证删除失败：'+error.message)}finally{renderCredentials(artifactCredentials)}};
-async function startPipelineRun(mode='oauth'){const scope=$('#pipelineScope').value,accounts=pipelineRunnableAccounts(scope),retryLimit=Math.max(0,Math.min(99,Number($('#pipelineRetryLimit').value)||0));if(!accounts.length){toast(scope==='selected'?'请先选择至少一个可运行账号':'当前范围内没有可运行账号');return}const isSession=mode==='session',isLogin=mode==='login',isGcash=mode==='gcash';if(isLogin&&accounts.length!==1){toast('仅登录一次只能选择 1 个账号，请只勾选一个');return}if(isGcash&&!gcashTabsReady()){toast('请先在「调试」页绑定「ChatGPT登录」和「153提炼」两个标签页并保存');return}let confirmText;if(isGcash){confirmText=`将对 ${accounts.length} 个账号串行执行 gcash 提炼：登录 → 取 accessToken → 153 提炼 → 打开付款链接。\n每个账号在拿到付款链接后都需要你人工扫码，扫码完成（页面跳回 chatgpt.com）才会继续下一个账号。确定继续？`}else if(isLogin){confirmText=`将登录账号 ${accounts[0].email}（仅登录：不导出 Session、不走 OAuth、不接码）。登录前会清理浏览器环境。确定继续？`}else if(isSession){confirmText=`将对 ${accounts.length} 个账号登录后导出 Session（仅邮箱验证码登录，不接码、不走 OAuth、不消耗短信；结果保存到后端 data/codex_sessions/{日期}）。确定继续？`}else{const rerun=accounts.filter(accountHasCredential).length,rerunNote=rerun?`\n其中 ${rerun} 个是已成功账号，重跑会重新走 OAuth，覆盖已保存的凭证并使旧 token 失效。`:'';confirmText=`将启动 ${accounts.length} 个账号，串行执行，临时失败最多重试 ${retryLimit} 次。此操作可能消耗短信号码。${rerunNote}确定继续？`}if(!confirm(confirmText))return;const startBtn=$('#startPipeline'),sessionBtn=$('#exportSessionPipeline'),loginBtn=$('#loginOnlyPipeline'),gcashBtn=$('#gcashPipeline');startBtn.disabled=true;sessionBtn.disabled=true;if(loginBtn)loginBtn.disabled=true;if(gcashBtn)gcashBtn.disabled=true;try{try{if(isGcash){/* gcash 走绑定标签页，前端这次清理只认活动页，会把绑定的 153 提炼页打成 about:blank；worker 会在登录标签页里自己清 */}else await runBrowserCleanup('开始新任务前清理浏览器环境',{quiet:true})}catch(error){console.warn('pre-start cleanup failed',error);toast('启动前浏览器清理失败，已继续尝试启动任务')}const j=await api('/api/codex-pipeline',{method:'POST',body:JSON.stringify({emails:accounts.map(account=>account.email),concurrency:1,retry_limit:retryLimit,retry_backoff_seconds:30,mode,confirmed:true})});pipelineState=j.pipeline||pipelineState;selectedAccountIds.clear();toast(isGcash?`已启动 gcash 提炼，${accounts.length} 个账号将串行处理（每个都要人工扫码）`:isLogin?`已开始登录 ${accounts[0].email}`:isSession?`已启动 Session 导出，${accounts.length} 个账号将串行处理`:`流水线已启动，${accounts.length} 个账号将串行处理`);await refresh()}catch(e){toast('启动失败：'+e.message)}finally{renderPipeline(pipelineState)}}
+async function startPipelineRun(mode='oauth'){const scope=$('#pipelineScope').value,isRegister=mode==='register',accounts=isRegister?registerRunnableAccounts(scope):pipelineRunnableAccounts(scope),retryLimit=Math.max(0,Math.min(99,Number($('#pipelineRetryLimit').value)||0));if(!accounts.length){toast(isRegister?'没有待注册的 smsbower-gmail 账号':scope==='selected'?'请先选择至少一个可运行账号':'当前范围内没有可运行账号');return}const isSession=mode==='session',isLogin=mode==='login',isGcash=mode==='gcash';if(isLogin&&accounts.length!==1){toast('仅登录一次只能选择 1 个账号，请只勾选一个');return}if(isGcash&&!gcashTabsReady()){toast('请先在「调试」页绑定「ChatGPT登录」和「153提炼」两个标签页并保存');return}let confirmText;if(isRegister){confirmText=`将对 ${accounts.length} 个账号串行执行注册：建号 → 设置密码 → 轮询 smsbower 邮箱验证码 → 填写 about-you。每个账号开始前都会清理浏览器环境，此操作会真实消耗取号费用。确定继续？`}else if(isGcash){confirmText=`将对 ${accounts.length} 个账号串行执行 gcash 提炼：登录 → 取 accessToken → 153 提炼 → 打开付款链接。\n每个账号在拿到付款链接后都需要你人工扫码，扫码完成（页面跳回 chatgpt.com）才会继续下一个账号。确定继续？`}else if(isLogin){confirmText=`将登录账号 ${accounts[0].email}（仅登录：不导出 Session、不走 OAuth、不接码）。登录前会清理浏览器环境。确定继续？`}else if(isSession){confirmText=`将对 ${accounts.length} 个账号登录后导出 Session（仅邮箱验证码登录，不接码、不走 OAuth、不消耗短信；结果保存到后端 data/codex_sessions/{日期}）。确定继续？`}else{const rerun=accounts.filter(accountHasCredential).length,rerunNote=rerun?`\n其中 ${rerun} 个是已成功账号，重跑会重新走 OAuth，覆盖已保存的凭证并使旧 token 失效。`:'';confirmText=`将启动 ${accounts.length} 个账号，串行执行，临时失败最多重试 ${retryLimit} 次。此操作可能消耗短信号码。${rerunNote}确定继续？`}if(!confirm(confirmText))return;const startBtn=$('#startPipeline'),sessionBtn=$('#exportSessionPipeline'),loginBtn=$('#loginOnlyPipeline'),gcashBtn=$('#gcashPipeline'),registerBtn=$('#registerPipeline');startBtn.disabled=true;sessionBtn.disabled=true;if(loginBtn)loginBtn.disabled=true;if(gcashBtn)gcashBtn.disabled=true;if(registerBtn)registerBtn.disabled=true;try{try{if(isGcash){/* gcash 走绑定标签页，前端这次清理只认活动页，会把绑定的 153 提炼页打成 about:blank；worker 会在登录标签页里自己清 */}else await runBrowserCleanup('开始新任务前清理浏览器环境',{quiet:true})}catch(error){console.warn('pre-start cleanup failed',error);toast('启动前浏览器清理失败，已继续尝试启动任务')}const j=await api('/api/codex-pipeline',{method:'POST',body:JSON.stringify({emails:accounts.map(account=>account.email),concurrency:1,retry_limit:retryLimit,retry_backoff_seconds:30,mode,confirmed:true})});pipelineState=j.pipeline||pipelineState;selectedAccountIds.clear();toast(isRegister?`已启动注册，${accounts.length} 个账号将串行处理`:isGcash?`已启动 gcash 提炼，${accounts.length} 个账号将串行处理（每个都要人工扫码）`:isLogin?`已开始登录 ${accounts[0].email}`:isSession?`已启动 Session 导出，${accounts.length} 个账号将串行处理`:`流水线已启动，${accounts.length} 个账号将串行处理`);await refresh()}catch(e){toast('启动失败：'+e.message)}finally{renderPipeline(pipelineState)}}
 $('#startPipeline').onclick=()=>startPipelineRun('oauth');
 $('#exportSessionPipeline').onclick=()=>startPipelineRun('session');
 $('#loginOnlyPipeline').onclick=()=>startPipelineRun('login');
 $('#gcashPipeline').onclick=()=>startPipelineRun('gcash');
+$('#registerPipeline').onclick=()=>startPipelineRun('register');
 $('#exportGcashResults').onclick=exportGcashResults;
+$('#exportAccounts').onclick=exportAccounts;
 $('#pausePipeline').onclick=async()=>{if(!pipelineState||!pipelineState.id)return;const button=$('#pausePipeline');button.disabled=true;try{const j=await api(`/api/codex-pipeline/${encodeURIComponent(pipelineState.id)}/pause`,{method:'POST',body:'{}'});pipelineState=j.pipeline||pipelineState;toast('流水线已暂停派发新任务');await refresh()}catch(e){toast('暂停失败：'+e.message)}finally{button.disabled=false;renderPipeline(pipelineState)}};
 $('#resumePipeline').onclick=async()=>{if(!pipelineState||!pipelineState.id)return;const button=$('#resumePipeline');button.disabled=true;try{const j=await api(`/api/codex-pipeline/${encodeURIComponent(pipelineState.id)}/resume`,{method:'POST',body:'{}'});pipelineState=j.pipeline||pipelineState;toast('流水线已继续运行');await refresh()}catch(e){toast('继续失败：'+e.message)}finally{button.disabled=false;renderPipeline(pipelineState)}};
 $('#stopPipeline').onclick=async()=>{if(!pipelineState||!pipelineState.id)return;if(!confirm('将停止继续领取后续任务；已进入网络步骤的任务可能需要等待当前步骤返回。确定继续？'))return;const button=$('#stopPipeline');button.disabled=true;try{await api(`/api/codex-pipeline/${encodeURIComponent(pipelineState.id)}/stop`,{method:'POST',body:'{}'});toast('已请求停止后续任务');await refresh()}catch(e){toast('停止失败：'+e.message)}finally{button.disabled=false}};
@@ -488,6 +789,20 @@ $('#smsbowerCredential').oninput=()=>{if($('#smsbowerCredential').value)$('#smsb
 $('#toggleSmsbowerCredential').onclick=async()=>{const input=$('#smsbowerCredential'),button=$('#toggleSmsbowerCredential');if(input.type==='text'){hideSmsbowerCredential();input.focus();return}button.disabled=true;try{if(!input.value&&smsbowerCredentialConfigured){const j=await api('/api/sms-config/reveal',{method:'POST',body:JSON.stringify({provider:'smsbower',confirmed:true})});input.value=j.credential||''}input.type='text';button.textContent='隐藏';button.setAttribute('aria-pressed','true');input.focus()}catch(e){toast(e.message)}finally{button.disabled=false}};
   function smsbowerSettingsPayload(){if(!$('#smsbowerEnabled').checked)return {channel_priority:['hero']};const countries=smsbowerCountryPicker.getSelected();if(!countries.length)throw new Error('启用 smsbower 后请至少选择 1 个国家加入优先队列');if(countries.length>10)throw new Error('smsbower 国家队列最多 10 个');const prices=smsbowerCountryPicker.getPrices(),country_prices={};countries.forEach(id=>{const e=prices[id]||{},rawMax=String(e.max==null?'':e.max).trim(),rawMin=String(e.min==null?'':e.min).trim();if(!rawMax)throw new Error(`请为 smsbower 国家 ${id} 填写价格上限（maxPrice）`);const mx=Number(rawMax);if(!Number.isFinite(mx)||mx<=0)throw new Error(`smsbower 国家 ${id} 的价格上限必须是大于 0 的数字`);if(rawMin){const mn=Number(rawMin);if(!Number.isFinite(mn)||mn<0)throw new Error(`smsbower 国家 ${id} 的最低价必须是大于等于 0 的数字`);if(mn>mx)throw new Error(`smsbower 国家 ${id} 的最低价不能高于价格上限`)}country_prices[id]=rawMin?{min:rawMin,max:rawMax}:{max:rawMax}});const priority=$('#channelPriority').value==='smsbower_first'?['smsbower','hero']:['hero','smsbower'];return {channel_priority:priority,smsbower:{credential:$('#smsbowerCredential').value,clear_credential:$('#smsbowerClearCredential').checked,countries,country_prices,min_price:null,max_price:null,acquire_priority:'country',code_wait:$('#smsbowerCodeWait').value}}}
   $('#saveSmsConfig').onclick=async()=>{const button=$('#saveSmsConfig');button.disabled=true;try{const hero=heroSettingsPayload(true),sb=smsbowerSettingsPayload(),payload={provider:'hero',country:hero.countries[0]||'',service:'dr',countries:hero.countries,country_prices:hero.country_prices,min_price:hero.min_price,max_price:hero.max_price,preferred_price:hero.preferred_price,acquire_priority:hero.acquire_priority,code_wait:$('#smsCodeWait').value,credential:$('#smsCredential').value,clear_credential:$('#smsClearCredential').checked,channel_priority:sb.channel_priority,...(sb.smsbower?{smsbower:sb.smsbower}:{})};const j=await api('/api/sms-config',{method:'POST',body:JSON.stringify(payload)}),saved=j.config||{};renderSmsConfig(saved);toast(j.codex&&j.codex.available?'Hero SMS 配置已保存，Codex OAuth 已就绪':'Hero SMS 配置已保存：'+((j.codex&&j.codex.reason)||'请检查配置'));refresh()}catch(e){toast(e.message)}finally{button.disabled=false}};
-document.addEventListener('click',async e=>{const del=e.target.closest('[data-delete]'),credential=e.target.closest('[data-download-credential]'),accountCredential=e.target.closest('[data-account-credential]'),log=e.target.closest('[data-download-log]');try{if(accountCredential){if(confirm('该文件包含完整 OAuth Token，请只保存在可信设备上。确定导出？'))await triggerDownload(`/api/accounts/${encodeURIComponent(accountCredential.dataset.accountCredential)}/credential/download?confirmed=1`);return}if(credential){if(confirm('该文件可能包含完整 OAuth Token。确定下载到本机？'))await triggerDownload(`/api/artifacts/credentials/${encodeURIComponent(credential.dataset.downloadCredential)}/download?confirmed=1`);return}if(log){if(confirm('日志可能包含账号标识和错误上下文。确定下载？'))await triggerDownload(`/api/artifacts/logs/${encodeURIComponent(log.dataset.downloadLog)}/download?confirmed=1`);return}if(del&&confirm('将删除本地邮箱取码素材，确定继续？')){await api(`/api/accounts/${encodeURIComponent(del.dataset.delete)}`,{method:'DELETE'});selectedAccountIds.delete(String(del.dataset.delete));toast('本地素材已删除');await refresh()}}catch(err){toast(err.message)}});
-async function initializeExtension(){configureSerialPipelineUi();updateImportHelper();renderOnboarding();switchWorkspace('accounts');bindDebugTabEvents();await loadDebugSelectedTab();try{await loadExtensionBootstrap()}catch(error){toast('扩展引导失败：'+error.message)}ensureBrowserBridgeLoop();await loadSmsConfig();await refresh();await loadGcashTabs();await loadArtifacts();setInterval(refresh,2000);setInterval(()=>{if(currentView==='results'){loadArtifacts();loadSmsStats({silent:true})}},10000)}
+// 人工补 MFA 的入口：自动开 2FA 失败（或用户自己在浏览器里开的）之后，把密码和
+// Base32 密钥填回来。密钥**从不回传给前端**（清单接口只说有没有），所以输入框永远
+// 是空的，留空 = 保持原值——否则一保存就会把已有密钥清掉。
+let editingAccountId='';
+function accountEditorState(text,ok=false){const target=$('#accountEditorState');target.className=`account-editor-state${ok?' ok':''}`;target.textContent=text||''}
+function openAccountEditor(id){const account=accountRows.find(row=>String(row.id)===String(id));if(!account){toast('账号不存在，请刷新后重试');return}editingAccountId=String(id);$('#accountEditorEmail').textContent=account.email;$('#accountEditPassword').value=String(account.signup_password||'');$('#accountEditSecret').value='';$('#accountEditSecret').placeholder=account.has_totp_secret?'已保存密钥，留空表示不修改':'请粘贴 32 位 Base32 密钥';$('#accountEditPlus').checked=account.plus_trial===true;const codexStatus=String(account.codex_status||'').toLowerCase();$('#accountEditCodexStatus').value=codexStatus==='success'||codexStatus==='failed'?codexStatus:'';accountEditorState(account.otp_ready?'该账号素材已就绪，保存会覆盖填写的项。':'填好密码和 2FA 密钥后，账号会自动变成可用的「密码 + TOTP 2FA」素材。',account.otp_ready);$('#accountEditor').hidden=false;$('#accountEditPassword').focus()}
+function closeAccountEditor(){editingAccountId='';$('#accountEditor').hidden=true;accountEditorState('')}
+async function saveAccountEditor(){if(!editingAccountId)return;const button=$('#accountEditSave'),password=$('#accountEditPassword').value.trim(),secret=$('#accountEditSecret').value.trim(),codexStatus=$('#accountEditCodexStatus').value;const account=accountRows.find(row=>String(row.id)===editingAccountId)||{},currentCodexStatus=String(account.codex_status||'').toLowerCase();if(!password&&!secret&&$('#accountEditPlus').checked===account.plus_trial&&(!codexStatus||codexStatus===currentCodexStatus)){closeAccountEditor();return}button.disabled=true;accountEditorState('正在保存…');try{const j=await api(`/api/accounts/${encodeURIComponent(editingAccountId)}/credentials`,{method:'POST',body:JSON.stringify({password,totp_secret:secret,plus_trial:$('#accountEditPlus').checked,codex_status:codexStatus||undefined})});const row=j.account||{};toast(row.otp_ready?'已保存，该账号素材已就绪':'已保存');closeAccountEditor();await refresh()}catch(err){accountEditorState(err.message)}finally{button.disabled=false}}
+$('#accountEditCancel').onclick=closeAccountEditor;
+$('#accountEditSave').onclick=saveAccountEditor;
+$('#accountEditor').onclick=e=>{if(e.target===$('#accountEditor'))closeAccountEditor()};
+$('#accountEditSecret').onkeydown=e=>{if(e.key==='Enter')saveAccountEditor()};
+$('#accountEditPassword').onkeydown=e=>{if(e.key==='Enter')saveAccountEditor()};
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#accountEditor').hidden)closeAccountEditor()});
+document.addEventListener('click',async e=>{const del=e.target.closest('[data-delete]'),credential=e.target.closest('[data-download-credential]'),accountCredential=e.target.closest('[data-account-credential]'),log=e.target.closest('[data-download-log]'),edit=e.target.closest('[data-account-edit]');try{if(edit){openAccountEditor(edit.dataset.accountEdit);return}if(accountCredential){if(confirm('该文件包含完整 OAuth Token，请只保存在可信设备上。确定导出？'))await triggerDownload(`/api/accounts/${encodeURIComponent(accountCredential.dataset.accountCredential)}/credential/download?confirmed=1`);return}if(credential){if(confirm('该文件可能包含完整 OAuth Token。确定下载到本机？'))await triggerDownload(`/api/artifacts/credentials/${encodeURIComponent(credential.dataset.downloadCredential)}/download?confirmed=1`);return}if(log){if(confirm('日志可能包含账号标识和错误上下文。确定下载？'))await triggerDownload(`/api/artifacts/logs/${encodeURIComponent(log.dataset.downloadLog)}/download?confirmed=1`);return}if(del&&confirm('将删除本地邮箱取码素材，确定继续？')){await api(`/api/accounts/${encodeURIComponent(del.dataset.delete)}`,{method:'DELETE'});selectedAccountIds.delete(String(del.dataset.delete));toast('本地素材已删除');await refresh()}}catch(err){toast(err.message)}});
+async function initializeExtension(){configureSerialPipelineUi();updateImportHelper();updateProxyAddButton();renderOnboarding();switchWorkspace('accounts');bindDebugTabEvents();await loadDebugSelectedTab();try{await loadExtensionBootstrap()}catch(error){toast('扩展引导失败：'+error.message)}ensureBrowserBridgeLoop();await loadSmsConfig();await refresh();await loadGcashTabs();await loadProxies();await loadArtifacts();setInterval(refresh,2000);setInterval(pollNotices,2000);setInterval(()=>{if(currentView==='results'){loadArtifacts();loadSmsStats({silent:true})}},10000)}
 initializeExtension();

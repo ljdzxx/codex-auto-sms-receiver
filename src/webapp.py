@@ -18,15 +18,30 @@ from flask import Flask, jsonify, request, send_file
 
 from .artifact_store import ArtifactStore, _redact_log_text
 from .browser_bridge import BrowserBridgeTimeout, browser_bridge
+from .browser_config_store import BrowserConfigStore
 from .gcash_store import GcashTabStore
 from .hero_catalog import HeroCatalog
 from .hero_pricing import HeroPricingClient, HeroPricingError, filter_price_tiers
 from .hero_sms import SMSBOWER_API_BASE
 from .mailbox_store import MailboxStore
+from .proxy_store import ProxyParseError, ProxyStore
+from .proxy_tester import test_proxies
 from .settings import Settings
 from .sms_config import SmsConfigStore, normalize_hero_countries, normalize_price
+from .smsbower_mail import (
+    MAIL_STATUS_CANCEL,
+    SmsbowerMailClient,
+    SmsbowerMailError,
+    SmsbowerMailOutOfStockError,
+)
+from .smsbower_mail_store import MAIL_DOMAIN, MAIL_SERVICE, SmsbowerMailConfigStore
 
 _EXTENSION_ORIGIN_PREFIXES = ("chrome-extension://", "moz-extension://")
+
+
+class _ActivationStoreError(RuntimeError):
+    """租到号却存不下来：号已经退回，消息里写清退了几个。"""
+
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_EXTENSION_FILE_BYTES = 24 * 1024 * 1024
 
@@ -67,6 +82,8 @@ def create_app(
     hero_pricing=None,
     smsbower_pricing=None,
     artifact_store=None,
+    smsbower_mail_store=None,
+    smsbower_mail_client_factory=None,
     **_legacy,
 ) -> Flask:
     if not _is_loopback_host(settings.host):
@@ -81,10 +98,16 @@ def create_app(
     hero_catalog = hero_catalog or HeroCatalog()
     artifact_store = artifact_store or ArtifactStore(settings.data_dir, settings.log_dir)
     gcash_tab_store = GcashTabStore(settings.data_dir)
+    proxy_store = ProxyStore(settings.data_dir)
+    browser_config_store = BrowserConfigStore(settings.data_dir)
+    smsbower_mail_store = smsbower_mail_store or SmsbowerMailConfigStore(settings.data_dir)
+    smsbower_mail_client_factory = smsbower_mail_client_factory or (
+        lambda api_key: SmsbowerMailClient(api_key)
+    )
     if codex_manager is None:
         from .codex_service import CodexJobManager
 
-        codex_manager = CodexJobManager(settings, mailbox_store)
+        codex_manager = CodexJobManager(settings, mailbox_store, proxy_store=proxy_store)
 
     def _task_observed(job):
         if not isinstance(job, dict):
@@ -402,6 +425,153 @@ def create_app(
     @app.get("/api/accounts")
     def list_accounts():
         return jsonify({"ok": True, "accounts": _account_rows()})
+
+    @app.get("/api/notices")
+    def list_notices():
+        # 侧边栏用它把流水线里的静默阶段（尤其是每 5s 一次的取码轮询）变成提示。
+        # after=-1 表示"我刚连上，只要游标别补历史"，避免一开面板就弹一串旧提示。
+        from .notice_store import notices
+
+        try:
+            after = int(request.args.get("after", -1))
+        except (TypeError, ValueError):
+            after = -1
+        return jsonify({"ok": True, **notices.since(after)})
+
+    @app.get("/api/smsbower-mail-config")
+    def get_smsbower_mail_config():
+        return jsonify({"ok": True, "config": smsbower_mail_store.public()})
+
+    @app.post("/api/smsbower-mail-config")
+    def save_smsbower_mail_config():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        try:
+            config = smsbower_mail_store.save(data)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, "config": config})
+
+    def _store_activations(client, acquired: list[dict]) -> dict:
+        """Record rented mailboxes, handing back anything that cannot be stored."""
+
+        try:
+            result = mailbox_store.import_activations(acquired)
+        except Exception as exc:
+            # The mailboxes are already rented and billed. If they cannot be
+            # recorded there is no way to reach them again, so hand them back
+            # instead of silently paying for addresses nobody will ever use.
+            released = sum(1 for item in acquired if client.release(item["mail_id"], MAIL_STATUS_CANCEL))
+            logging.getLogger(__name__).warning(
+                "[smsbower-gmail] 取号成功但入库失败，已退回 %d/%d 个：%s", released, len(acquired), exc
+            )
+            raise _ActivationStoreError(f"取号成功但保存失败，已退回 {released} 个：{exc}") from exc
+        # Same address rented twice: the old activation id is no longer reachable
+        # from any record, so give it back instead of leaving it billing.
+        for stale_id in result.pop("superseded", []):
+            client.release(stale_id, MAIL_STATUS_CANCEL)
+        return result
+
+    def _acquire_one_smsbower_gmail() -> str:
+        """Rent exactly one gmail address, store it, and return it.
+
+        取号+注册流水线每处理完一个账号才调一次这里：号一租下来就开始计费，
+        提前把 N 个号全租好等于让排在后面的号白付租金。
+        """
+
+        config = smsbower_mail_store.get()
+        if not config.get("api_key"):
+            raise RuntimeError("请先保存 smsbower 邮箱 API Key")
+        client = smsbower_mail_client_factory(config["api_key"])
+        activation = client.acquire(
+            service=MAIL_SERVICE,
+            domain=MAIL_DOMAIN,
+            max_price=config.get("max_price", ""),
+        )
+        _store_activations(client, [{"email": activation.email, "mail_id": activation.mail_id}])
+        return str(activation.email)
+
+    @app.post("/api/accounts/import-smsbower-gmail")
+    def import_smsbower_gmail_accounts():
+        data = request.get_json(silent=True) or {}
+        try:
+            count = int(data.get("count", 1))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "取号数量必须是整数"}), 400
+        if count < 1:
+            return jsonify({"ok": False, "error": "取号数量必须大于 0"}), 400
+        config = smsbower_mail_store.get()
+        if not config.get("api_key"):
+            return jsonify({"ok": False, "error": "请先保存 smsbower 邮箱 API Key"}), 400
+
+        client = smsbower_mail_client_factory(config["api_key"])
+        acquired: list[dict] = []
+        failure = ""
+        for _ in range(count):
+            try:
+                activation = client.acquire(
+                    service=MAIL_SERVICE,
+                    domain=MAIL_DOMAIN,
+                    max_price=config.get("max_price", ""),
+                )
+            except SmsbowerMailOutOfStockError as exc:
+                failure = f"{exc}（已取到 {len(acquired)} 个）"
+                break
+            except SmsbowerMailError as exc:
+                failure = str(exc)
+                break
+            acquired.append({"email": activation.email, "mail_id": activation.mail_id})
+        if not acquired:
+            return jsonify({"ok": False, "error": failure or "没有取到可用的邮箱"}), 400
+        try:
+            result = _store_activations(client, acquired)
+        except _ActivationStoreError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": True, "acquired": len(acquired), "warning": failure, **result})
+
+    @app.post("/api/accounts/acquire-register-smsbower-gmail")
+    def acquire_and_register_smsbower_gmail():
+        """取一个号 → 立刻注册它 → 再取下一个，直到取满 count 个。
+
+        取号和注册合成一次操作：号一租下来就计费，先批量租号再排队注册会让
+        排在后面的号一直付租金；同时也避免注册中断时留下一堆没人管的号。
+        """
+
+        data = request.get_json(silent=True) or {}
+        if data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "必须确认该操作会真实消耗取号费用"}), 400
+        try:
+            count = int(data.get("count", 1))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "取号数量必须是整数"}), 400
+        if count < 1:
+            return jsonify({"ok": False, "error": "取号数量必须大于 0"}), 400
+        if not smsbower_mail_store.get().get("api_key"):
+            return jsonify({"ok": False, "error": "请先保存 smsbower 邮箱 API Key"}), 400
+        starter = getattr(codex_manager, "start_batch", None)
+        if not callable(starter):
+            return jsonify({"ok": False, "error": "当前任务管理器不支持流水线"}), 501
+        try:
+            pipeline = starter(
+                [],
+                concurrency=1,
+                retry_limit=data.get("retry_limit", 0),
+                retry_backoff_seconds=data.get("retry_backoff_seconds", 30),
+                mode="register",
+                supplier=_acquire_one_smsbower_gmail,
+                supply_count=count,
+                # 取号失败（多半是库存空）等多久再试。codex_service 对 smsbower
+                # 一无所知，所以间隔在这里从配置读出来传进去。
+                supply_retry_seconds=smsbower_mail_store.get().get("supply_retry_seconds", 10),
+                # 账号成功或失败收尾后，首次领取下一个账号前的独立间隔。
+                next_account_interval_seconds=smsbower_mail_store.get().get(
+                    "next_account_interval_seconds", 60
+                ),
+            )
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+        return jsonify({"ok": True, "count": count, "pipeline": pipeline}), 202
 
     @app.get("/api/sms-config")
     def get_sms_config():
@@ -1150,6 +1320,93 @@ def create_app(
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify({"ok": True, "tabs": saved})
 
+    @app.get("/api/browser-config")
+    def get_browser_config():
+        return jsonify({"ok": True, "config": browser_config_store.public()})
+
+    @app.post("/api/browser-config")
+    def save_browser_config():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        try:
+            browser_config_store.save(data)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, "config": browser_config_store.public()})
+
+    @app.get("/api/proxies")
+    def list_proxies():
+        return jsonify({"ok": True, **proxy_store.state()})
+
+    @app.post("/api/proxies")
+    def add_proxies():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        try:
+            result = proxy_store.add_many(str(data.get("text") or ""), str(data.get("label") or ""))
+        except ProxyParseError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, **result})
+
+    @app.post("/api/proxies/enabled")
+    def set_proxy_pool_enabled():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+            return jsonify({"ok": False, "error": "请提交 enabled 布尔值"}), 400
+        return jsonify({"ok": True, **proxy_store.set_enabled(data["enabled"])})
+
+    @app.post("/api/proxies/<proxy_id>/enabled")
+    def set_single_proxy_enabled(proxy_id: str):
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+            return jsonify({"ok": False, "error": "请提交 enabled 布尔值"}), 400
+        try:
+            return jsonify({"ok": True, **proxy_store.set_proxy_enabled(proxy_id, data["enabled"])})
+        except KeyError:
+            return jsonify({"ok": False, "error": "代理不存在"}), 404
+
+    @app.delete("/api/proxies/<proxy_id>")
+    def delete_proxy(proxy_id: str):
+        try:
+            return jsonify({"ok": True, **proxy_store.delete(proxy_id)})
+        except KeyError:
+            return jsonify({"ok": False, "error": "代理不存在"}), 404
+
+    @app.post("/api/proxies/test")
+    def run_proxy_test():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        raw_ids = data.get("proxy_ids")
+        if raw_ids is None:
+            # No explicit selection = 一键测试 the whole pool.
+            targets = [row["id"] for row in proxy_store.state()["proxies"]]
+        elif isinstance(raw_ids, list):
+            targets = [str(value).strip() for value in raw_ids if str(value or "").strip()]
+        else:
+            return jsonify({"ok": False, "error": "proxy_ids 必须是数组"}), 400
+        if not targets:
+            return jsonify({"ok": False, "error": "代理池为空"}), 400
+        if len(targets) > 100:
+            return jsonify({"ok": False, "error": "每次最多测试 100 条代理"}), 413
+        records = [record for record in (proxy_store.get_raw(value) for value in targets) if record]
+        if not records:
+            return jsonify({"ok": False, "error": "所选代理不存在"}), 404
+        for outcome in test_proxies(records):
+            proxy_store.record_test(
+                outcome.get("id") or "",
+                ok=bool(outcome.get("ok")),
+                ip=str(outcome.get("ip") or ""),
+                location=str(outcome.get("location") or ""),
+                latency_ms=outcome.get("latency_ms"),
+                message=str(outcome.get("message") or ""),
+                country_code=str(outcome.get("country_code") or ""),
+                timezone=str(outcome.get("timezone") or ""),
+            )
+        return jsonify({"ok": True, "tested": len(records), **proxy_store.state()})
+
     @app.post("/api/accounts/gcash-export")
     def export_gcash_results():
         if not _is_loopback_host(settings.host):
@@ -1231,6 +1488,45 @@ def create_app(
         if not mailbox_store.delete(account_id):
             return jsonify({"ok": False, "error": "账号不存在"}), 404
         return jsonify({"ok": True})
+
+    @app.post("/api/accounts/<account_id>/credentials")
+    def update_account_credentials(account_id: str):
+        """人工补全一个注册账号的密码 / 2FA 密钥（自动开 2FA 失败后的补救入口）。
+
+        密钥留空 = 保持原值：清单接口从不回传密钥，编辑框里永远是空的，不这么定
+        就会"一保存把密钥清掉"。
+        """
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        account = mailbox_store.get_secret(account_id=account_id)
+        if account is None:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        active = getattr(codex_manager, "is_account_active", None)
+        if callable(active) and active(str(account.get("email") or "")):
+            return jsonify({"ok": False, "error": "账号正在流水线中，暂时不能编辑"}), 409
+        plus_trial = data.get("plus_trial")
+        if plus_trial is not None and not isinstance(plus_trial, bool):
+            return jsonify({"ok": False, "error": "plus_trial 只能是 true / false"}), 400
+        register_status = data.get("register_status")
+        if register_status is not None and register_status not in ("pending", "registered", "success", "failed"):
+            return jsonify({"ok": False, "error": "register_status 只能是 pending / registered / success / failed"}), 400
+        codex_status = data.get("codex_status")
+        if codex_status is not None and codex_status not in ("success", "failed"):
+            return jsonify({"ok": False, "error": "codex_status 只能是 success / failed"}), 400
+        try:
+            row = mailbox_store.update_manual_credentials(
+                account_id,
+                password=data.get("password"),
+                totp_secret=data.get("totp_secret"),
+                plus_trial=plus_trial,
+                register_status=register_status,
+                codex_status=codex_status,
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, "account": row})
 
     @app.post("/api/codex-pipeline")
     def start_codex_pipeline():

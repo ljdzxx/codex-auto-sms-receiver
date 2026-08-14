@@ -479,3 +479,85 @@ def test_structured_api_accepts_valid_code_without_mail_when_after_ts_is_none():
     )
 
     assert code == "345678"
+
+
+def _mail_card(subject: str, date: str, body_code: str, meta: str = "noreply@icloud.com") -> str:
+    return (
+        '<article class="mail-card"><details>'
+        f'<summary><span class="subject">{subject}</span>'
+        f'<span class="date">{date}</span></summary>'
+        f'<div class="meta">发件人：{meta}</div>'
+        f'<pre class="body">输入此临时验证码以继续：\n\n{body_code}\n\nChatGPT 团队</pre>'
+        "</details></article>"
+    )
+
+
+def _mail_card_page(cards: list[str]) -> str:
+    return (
+        '<!doctype html><html><body><div class="wrap">'
+        + "".join(cards)
+        + "</div></body></html>"
+    )
+
+
+MAIL_CARD_PAGE_URL = "https://mail.example.test/messages/token/owner%40icloud.com"
+
+
+def test_mail_card_inbox_picks_newest_fresh_otp_over_stale_top_of_page():
+    # 页面按时间倒序，但正确码在最新一封；旧邮件里残留的 835012 不能命中。
+    page = _mail_card_page(
+        [
+            _mail_card("你的临时 ChatGPT 登录代码", "2026-08-11 10:06:23", "380617"),
+            _mail_card("Your temporary ChatGPT login code", "2026-08-11 09:39:05", "835012"),
+            _mail_card("Your temporary ChatGPT login code", "2026-08-11 03:45:32", "505523"),
+        ]
+    )
+    session = FakeSession({MAIL_CARD_PAGE_URL: FakeResponse(url=MAIL_CARD_PAGE_URL, text=page)})
+    after_ts = datetime(2026, 8, 11, 10, 6, 14).timestamp()
+
+    code = mail_client._fetch_current_code(
+        session,
+        MAIL_CARD_PAGE_URL,
+        HEADERS,
+        after_ts=after_ts,
+    )
+
+    assert code == "380617"
+
+
+def test_mail_card_inbox_rejects_all_stale_otps():
+    page = _mail_card_page(
+        [
+            _mail_card("Your temporary ChatGPT login code", "2026-08-11 09:39:05", "835012"),
+            _mail_card("Your temporary ChatGPT login code", "2026-08-11 03:45:32", "505523"),
+        ]
+    )
+    session = FakeSession({MAIL_CARD_PAGE_URL: FakeResponse(url=MAIL_CARD_PAGE_URL, text=page)})
+    after_ts = datetime(2026, 8, 11, 10, 6, 14).timestamp()
+
+    code = mail_client._fetch_current_code(
+        session,
+        MAIL_CARD_PAGE_URL,
+        HEADERS,
+        after_ts=after_ts,
+    )
+
+    assert code is None
+
+
+def test_mail_card_inbox_excludes_already_consumed_code():
+    page = _mail_card_page(
+        [_mail_card("你的临时 ChatGPT 登录代码", "2026-08-11 10:06:23", "380617")]
+    )
+    session = FakeSession({MAIL_CARD_PAGE_URL: FakeResponse(url=MAIL_CARD_PAGE_URL, text=page)})
+    after_ts = datetime(2026, 8, 11, 10, 6, 14).timestamp()
+
+    code = mail_client._fetch_current_code(
+        session,
+        MAIL_CARD_PAGE_URL,
+        HEADERS,
+        after_ts=after_ts,
+        exclude_codes={"380617"},
+    )
+
+    assert code is None

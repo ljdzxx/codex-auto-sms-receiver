@@ -17,10 +17,15 @@
     "browsingData",
     "cookies",
     "debugger",
+    "declarativeNetRequest",
+    "privacy",
+    "proxy",
     "sidePanel",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "webRequest",
+    "webRequestAuthProvider"
   ],
   "host_permissions": [
     "<all_urls>"

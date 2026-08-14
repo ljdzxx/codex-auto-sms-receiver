@@ -18,6 +18,7 @@
   <nav class="workspace-tabs" aria-label="工作区">
     <button type="button" class="workspace-tab active" data-view="accounts" aria-current="page">账号与任务</button>
     <button type="button" class="workspace-tab" data-view="sms">接码配置</button>
+    <button type="button" class="workspace-tab" data-view="proxy">代理</button>
     <button type="button" class="workspace-tab" data-view="results">凭证与统计</button>
     <button type="button" class="workspace-tab" data-view="logs">运行日志</button>
     <button type="button" class="workspace-tab" data-view="debug">调试</button>
@@ -33,15 +34,28 @@
             <strong>选择登录方式，然后粘贴账号素材</strong>
             <p>一行一个账号。密码和 2FA 密钥等敏感素材仅保存在本机。</p>
             <div class="import-format-card"><span>当前格式</span><code id="importFormatExample">email----邮箱密码----clientId----refreshToken</code></div>
-            <div class="import-local-note">不会创建或注册新账号</div>
+            <div class="import-local-note" id="importLocalNote">不会创建或注册新账号</div>
           </aside>
           <div class="import-form">
             <label for="source">登录素材类型</label>
-            <select id="source"><option value="outlook">Outlook / Microsoft Graph</option><option value="generic_api">iCloud 取码 API Key</option><option value="code_url">验证码 URL（HTML / JSON / 文本）</option><option value="password_totp">账号密码 + TOTP 2FA</option></select>
+            <select id="source"><option value="outlook">Outlook / Microsoft Graph</option><option value="generic_api">icloud.xbovo.online+API_KEY接码</option><option value="code_url">验证码 URL（HTML / JSON / 文本）</option><option value="password_totp">账号密码 + TOTP 2FA</option><option value="smsbower_gmail">smsbower-gmail（接口取号注册）</option></select>
             <div id="importSourceHint" class="import-source-hint">适用于 Outlook / Hotmail，使用 Microsoft Graph 读取验证码。</div>
-            <label for="materials">账号素材</label>
+            <div id="smsbowerGmailForm" class="smsbower-mail-form" hidden>
+              <div class="smsbower-mail-grid">
+                <label>API Key<input id="smsbowerMailKey" type="password" autocomplete="off" spellcheck="false" placeholder="留空表示不修改"></label>
+                <label>邮箱价格上限<input id="smsbowerMailMaxPrice" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="留空 = 不限价"></label>
+                <label>验证码超时（秒）<input id="smsbowerMailCodeTimeout" type="number" min="30" max="900" step="1"></label>
+                <label>验证码刷新频率（秒）<input id="smsbowerMailCodeInterval" type="number" min="2" max="60" step="1"></label>
+                <label title="取号失败（多半是库存空）后，再次尝试取同一个序号前等待多久。">取号失败重试间隔（秒）<input id="smsbowerMailSupplyRetry" type="number" min="5" max="600" step="1"></label>
+                <label title="一个账号成功或失败收尾后，首次领取并处理下一个账号前等待多久。">处理下一个账号间隔（秒）<input id="smsbowerMailNextAccountInterval" type="number" min="0" max="3600" step="1"></label>
+                <label>本次取号数量<input id="smsbowerMailCount" type="number" min="1" step="1" value="1"></label>
+              </div>
+              <div id="smsbowerMailState" class="smsbower-mail-state" aria-live="polite">正在读取配置……</div>
+              <div class="actions"><button type="button" id="saveSmsbowerMailConfig">保存配置</button></div>
+            </div>
+            <label for="materials" id="materialsLabel">账号素材</label>
             <textarea id="materials" spellcheck="false" placeholder="一行一个已有账号&#10;name@example.com----邮箱密码----clientId----refreshToken"></textarea>
-            <div class="import-input-meta"><span id="importLineCount">尚未粘贴账号</span><span>空行会自动忽略</span></div>
+            <div id="importInputMeta" class="import-input-meta"><span id="importLineCount">尚未粘贴账号</span><span>空行会自动忽略</span></div>
             <div id="importFeedback" class="import-feedback" aria-live="polite" hidden></div>
             <div class="actions import-actions"><button type="button" class="primary" id="importAccounts" disabled>导入账号</button></div>
           </div>
@@ -141,7 +155,7 @@
     </div>
     <div class="pipeline-launch">
       <div class="pipeline-launch-copy"><span>本批次</span><strong id="pipelineReadyTitle">正在计算可处理账号</strong><small id="pipelineSelectionHint">已有凭证、正在运行或登录素材未就绪的账号会自动跳过。</small></div>
-      <div class="pipeline-primary-actions"><button type="button" class="primary" id="startPipeline" disabled>暂无可处理账号</button><button type="button" id="exportSessionPipeline" disabled>导出 Session</button><button type="button" id="loginOnlyPipeline" disabled>仅登录</button><button type="button" id="gcashPipeline" disabled>gcash提炼</button><button type="button" id="pausePipeline" hidden>暂停流水线</button><button type="button" id="resumePipeline" class="primary" hidden>继续流水线</button><button type="button" id="stopPipeline" class="quiet-danger" hidden>停止后续任务</button></div>
+      <div class="pipeline-primary-actions"><button type="button" class="primary" id="startPipeline" disabled>暂无可处理账号</button><button type="button" id="exportSessionPipeline" disabled>导出 Session</button><button type="button" id="loginOnlyPipeline" disabled>仅登录</button><button type="button" id="gcashPipeline" disabled>gcash提炼</button><button type="button" id="registerPipeline" disabled>注册账号</button><button type="button" id="pausePipeline" hidden>暂停流水线</button><button type="button" id="resumePipeline" class="primary" hidden>继续流水线</button><button type="button" id="stopPipeline" class="quiet-danger" hidden>停止后续任务</button></div>
     </div>
     <details class="pipeline-settings" id="pipelineSettings" open>
       <summary><span>运行设置</span><small id="pipelineSettingsSummary">待处理账号 · 同时 1 个 · 失败重试 1 次</small></summary>
@@ -157,10 +171,64 @@
       <div id="pipelineCounts" class="pipeline-counts"><span>待处理 0</span><span>运行中 0</span><span>成功 0</span><span>失败 0</span></div>
     </div>
   </section>
+  <section class="card proxy-card" data-workspace="proxy" hidden>
+    <div class="head proxy-head">
+      <div><h2>🌐 代理管理</h2><p>管理代理池，按账号轮询分配：每个账号开始前，浏览器（地址栏 / fetch / XHR）都会切换到池中的下一个代理。</p></div>
+      <div class="proxy-head-actions">
+        <span id="proxyPoolState" class="proxy-pool-state">代理池已禁用</span>
+        <button type="button" id="proxyPoolToggle" class="proxy-switch" role="switch" aria-checked="false" aria-label="启用或禁用代理池"><span class="proxy-switch-knob"></span></button>
+        <button type="button" id="proxyTestAll">⚡ 一键测试</button>
+      </div>
+    </div>
+    <div class="body proxy-body">
+      <section class="proxy-add">
+        <h3>添加代理</h3>
+        <p class="proxy-hint">每行一个代理地址，支持 <code>http://</code> / <code>https://</code> / <code>socks5://</code>；地址部分接受 <code>host:port</code> 和 <code>user:pass@host:port</code> 两种格式（不写协议时默认 http）。凭证只保存在本机。</p>
+        <textarea id="proxyInput" spellcheck="false" placeholder="http://user:pass@ip:port&#10;socks5://ip:port"></textarea>
+        <div class="proxy-add-row">
+          <input id="proxyLabel" type="text" placeholder="标签（可选，如 &quot;美国&quot;、&quot;日本&quot;）" autocomplete="off">
+          <button type="button" class="primary" id="proxyAdd" disabled>确认添加</button>
+        </div>
+        <div id="proxyAddFeedback" class="proxy-feedback" aria-live="polite" hidden></div>
+      </section>
+      <div class="proxy-stats" id="proxyStats">
+        <div class="proxy-stat"><strong>0</strong><span>总代理数</span></div>
+        <div class="proxy-stat good"><strong>0</strong><span>已启用</span></div>
+        <div class="proxy-stat warn"><strong>0</strong><span>未测试</span></div>
+        <div class="proxy-stat bad"><strong>0</strong><span>测试失败</span></div>
+      </div>
+      <div id="proxyTable"><div class="empty">尚未添加代理</div></div>
+      <div class="proxy-add-row" style="grid-template-columns:auto minmax(0,1fr)">
+        <button type="button" id="proxyInspect">检查当前页指纹</button>
+        <span class="section-note">读取当前活动页真实看到的时区 / 语言 / WebRTC 状态，用来核对是否和「调试 → 指纹」里设定的值一致（时区与语言不再跟着代理自动变）。</span>
+      </div>
+      <div id="proxyActive" class="proxy-active" aria-live="polite">正在读取浏览器当前代理…</div>
+    </div>
+  </section>
   <section class="card" data-workspace="accounts">
-    <div class="head accounts-head"><div><h2>账号清单</h2><p id="accountsSummary">导入后的账号会显示在这里；可运行账号默认加入本批次。</p></div><div class="account-tools"><button type="button" class="primary account-import-shortcut" id="openImportFromAccounts">＋ 导入账号</button><button type="button" id="exportGcashResults">导出 gcash 提炼结果</button><select id="accountFilter" aria-label="筛选账号"><option value="all">全部状态</option><option value="pending">待处理</option><option value="active">运行中</option><option value="success">已成功</option><option value="failed">失败</option></select><input id="accountSearch" class="toolbar-search" type="text" placeholder="搜索邮箱或状态" autocomplete="off"></div></div>
+    <div class="head accounts-head"><div><h2>账号清单</h2><p id="accountsSummary">导入后的账号会显示在这里；可运行账号默认加入本批次。</p></div><div class="account-tools"><button type="button" class="primary account-import-shortcut" id="openImportFromAccounts">＋ 导入账号</button><button type="button" id="exportAccounts">导出账号</button><button type="button" id="exportGcashResults">导出 gcash 提炼结果</button><select id="accountFilter" aria-label="筛选账号"><option value="all">全部状态</option><option value="pending">待处理</option><option value="active">运行中</option><option value="success">已成功</option><option value="failed">失败</option></select><input id="accountSearch" class="toolbar-search" type="text" placeholder="搜索邮箱或状态" autocomplete="off"></div></div>
     <div id="accountBulkBar" class="account-bulk-bar" hidden><strong id="accountSelectedCount">已选 0 个</strong><span>可用于流水线，也可按原导入格式备份或批量删除。</span><button type="button" id="exportSelectedAccounts">导出原格式</button><button type="button" class="quiet-danger" id="deleteSelectedAccounts">删除所选</button><button type="button" id="clearAccountSelection">取消选择</button></div>
     <div id="accounts"><div class="empty">尚未导入账号</div></div>
+    <div id="accountEditor" class="account-editor" hidden>
+      <div class="account-editor-box" role="dialog" aria-modal="true" aria-labelledby="accountEditorTitle">
+        <h3 id="accountEditorTitle">编辑账号</h3>
+        <p id="accountEditorEmail" class="account-editor-email"></p>
+        <p class="account-editor-note">人工在浏览器里开好验证器 App 之后，把密码和 32 位 Base32 密钥填进来；两者都有了，账号会自动变成「密码 + TOTP 2FA」素材并立即可用。</p>
+        <label>登录密码<input id="accountEditPassword" type="text" autocomplete="off" spellcheck="false" placeholder="留空表示不修改"></label>
+        <label>2FA 密钥（Base32）<input id="accountEditSecret" type="text" autocomplete="off" spellcheck="false" placeholder="留空表示不修改"></label>
+        <label class="account-editor-check"><input id="accountEditPlus" type="checkbox">有 1 个月 Plus 免费资格</label>
+        <label>最近任务状态
+          <select id="accountEditCodexStatus">
+            <option value="">留空表示不修改</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+          </select>
+        </label>
+        <div id="accountEditorState" class="account-editor-state" aria-live="polite"></div>
+        <div class="account-editor-actions"><button type="button" id="accountEditCancel">取消</button><button type="button" class="primary" id="accountEditSave">保存</button></div>
+      </div>
+    </div>
+
   </section>
   <section class="archive-grid" data-workspace="results" hidden>
     <article class="card archive-wide">
@@ -246,6 +314,37 @@
     <div class="head">
       <div><h2>调试</h2><p>调试工具分两类：「标签页绑定」按你选中的标签页 id 精确操作（不抢焦点、不受活动页影响）；下方「添加密码」仍走当前活动标签页。</p></div>
     </div>
+    <section class="debug-section">
+      <div class="debug-section-head">
+        <h3>通用配置</h3>
+        <span class="debug-section-note" id="browserConfigSaved">未修改</span>
+      </div>
+      <p class="debug-hint">浏览器侧每一步的等待上限。网络慢、走代理、或页面跳转链很长时可以调大；后端等待时间会按这里的值自动放大（始终比浏览器侧长，避免两端同时超时把任务挂死）。改完立即生效，下一个账号就会用新值，<b>不需要重载扩展</b>。</p>
+      <label class="debug-field"><span>页面加载超时</span><input id="pageLoadTimeout" type="number" min="10" max="300" step="1" inputmode="numeric" aria-describedby="pageLoadTimeoutHint"><small id="pageLoadTimeoutHint" class="debug-field-unit">秒 · 打开一个网址后等它加载完（默认 45）</small></label>
+      <label class="debug-field"><span>元素等待超时</span><input id="elementWaitTimeout" type="number" min="5" max="300" step="1" inputmode="numeric" aria-describedby="elementWaitTimeoutHint"><small id="elementWaitTimeoutHint" class="debug-field-unit">秒 · 等邮箱框/验证码框等元素出现（默认 30）</small></label>
+      <div class="debug-actions">
+        <button type="button" id="saveBrowserConfig" class="primary-query">保存</button>
+        <button type="button" id="resetBrowserConfig" class="secondary-query">恢复默认</button>
+      </div>
+      <div id="browserConfigResult" class="debug-result" aria-live="polite">正在读取当前配置…</div>
+    </section>
+    <section class="debug-section">
+      <div class="debug-section-head">
+        <h3>指纹</h3>
+        <span class="debug-section-note" id="fingerprintState">未启用</span>
+      </div>
+      <p class="debug-hint">用 CDP（<code>Emulation.setTimezoneOverride</code> / <code>setLocaleOverride</code> / <code>setUserAgentOverride</code>）把浏览器报出的<b>时区与语言</b>固定成这里指定的值：地址栏打开的页面、页面里的 fetch/XHR 都会用它，<b>不再跟着代理所在地自动变</b>。启用后每个标签页都会挂上调试会话，Chrome 顶部出现「正在调试此浏览器」提示条属正常现象；改完<b>立即生效，不需要重载扩展</b>。<br><b>注意：语言会改变 OpenAI 的界面语言</b>，而流水线的阶段判据主要认中英文（曾因设成 <code>ja-JP</code> 拿到日文界面，把一次验证码已发出的流程判死）。不确定就用 <code>en-US</code>。</p>
+      <label class="debug-toggle"><input type="checkbox" id="fingerprintEnabled"> 启用指纹覆盖（作用于整个浏览器）</label>
+      <label class="debug-field"><span>时区</span><input id="fingerprintTimezone" type="text" list="fingerprintTimezoneList" placeholder="Asia/Shanghai" autocomplete="off" spellcheck="false"><small class="debug-field-unit" id="fingerprintTimezoneHint">IANA 时区名，可直接输入关键词筛选（如 Tokyo）</small></label>
+      <datalist id="fingerprintTimezoneList"></datalist>
+      <label class="debug-field"><span>语言</span><input id="fingerprintLanguage" type="text" list="fingerprintLanguageList" placeholder="en-US" autocomplete="off" spellcheck="false"><small class="debug-field-unit" id="fingerprintLanguageHint">BCP-47 语言标签，同时决定 <code>navigator.language</code> 与 <code>Accept-Language</code></small></label>
+      <datalist id="fingerprintLanguageList"></datalist>
+      <div class="debug-actions">
+        <button type="button" id="saveFingerprint" class="primary-query">保存并应用</button>
+        <button type="button" id="inspectFingerprintDebug" class="secondary-query">检查当前页</button>
+      </div>
+      <div id="fingerprintResult" class="debug-result" aria-live="polite">正在读取当前配置…</div>
+    </section>
     <section class="debug-section">
       <div class="debug-section-head">
         <h3>标签页绑定</h3>
